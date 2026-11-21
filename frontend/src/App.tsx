@@ -4,12 +4,43 @@ import { ArrowRight, Check, ChevronDown, Clock3, Code2, FileText, List, LoaderCi
 import { Button } from './components/ui/button'
 import { AnswerEditor } from './components/AnswerEditor'
 import { LearningsPage } from './components/LearningsPage'
+import { TestcaseBrowser, type CanonicalCase, type CustomCase, type CustomResult } from './components/TestcaseBrowser'
 import { additionalSolutions, solutions } from './solutions'
 
 type Question = { id: string; category: string; difficulty: string; title: string; prompt: string; coding: boolean; complete: boolean; starterCode?: string; testInstructions?: string }
 type Session = { id: string; questionId: string; questionTitle: string; category: string; answer: string; createdAt: string }
-type TestResult = { passed: boolean; total: number; failedTestIds: string[]; error?: string }
+type TestFailure = { id: string; input: string; expected: string; actual: string }
+type TestResult = { passed: boolean; total: number; failedTestIds: string[]; failures: TestFailure[] | null; error?: string }
+type RunResult = TestResult & { customResults?: CustomResult[] | null }
+type TestcaseData = { cases: CanonicalCase[]; customTemplate: { description: string; input: string } }
+const emptyTestcaseData: TestcaseData = { cases: [], customTemplate: { description: '', input: '' } }
 type Submission = TestResult & { code: string; createdAt: string }
+type Draft = {
+  value: string
+  loaded: boolean
+  status: 'loading' | 'ready' | 'saving' | 'saved' | 'error'
+  error: string
+  dirty: boolean
+  inFlight: boolean
+  flushKeepalive: boolean
+  timer?: number
+}
+
+const draftStorageKey = (id: string) => `practice-studio:draft:${id}`
+
+function readPendingDraft(id: string): string | null {
+  try { return localStorage.getItem(draftStorageKey(id)) } catch { return null }
+}
+
+function storePendingDraft(id: string, value: string) {
+  try { localStorage.setItem(draftStorageKey(id), value) } catch { /* Storage may be unavailable. */ }
+}
+
+function removePendingDraft(id: string, value: string) {
+  try {
+    if (localStorage.getItem(draftStorageKey(id)) === value) localStorage.removeItem(draftStorageKey(id))
+  } catch { /* Storage may be unavailable. */ }
+}
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options)
@@ -38,14 +69,19 @@ function App() {
   const [reloadQuestions, setReloadQuestions] = useState(0)
   const [reloadSessions, setReloadSessions] = useState(0)
   const [category, setCategory] = useState('All topics')
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const [problemTab, setProblemTab] = useState<{ id: string; tab: 'description' | 'solution' }>({ id: '', tab: 'description' })
+  const draftEntries = useRef<Record<string, Draft>>({})
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<{ questionId: string; message: string } | null>(null)
   const [savedId, setSavedId] = useState('')
   const [expandedSession, setExpandedSession] = useState('')
   const [testing, setTesting] = useState<Record<string, 'run' | 'submit' | undefined>>({})
-  const [testResults, setTestResults] = useState<Record<string, { code: string; result?: TestResult; error?: string; action: 'run' | 'submit' }>>({})
+  const [testResults, setTestResults] = useState<Record<string, { code: string; result?: RunResult; error?: string; action: 'run' | 'submit' }>>({})
+  const [customCases, setCustomCases] = useState<Record<string, CustomCase[]>>({})
+  const [testcases, setTestcases] = useState<Record<string, { data?: TestcaseData; loading: boolean; error: string }>>({})
+  const [reloadTestcases, setReloadTestcases] = useState(0)
+  const resultVersions = useRef<Record<string, number>>({})
   const [submissions, setSubmissions] = useState<{ questionId: string; items: Submission[]; error: string; loading: boolean }>({ questionId: '', items: [], error: '', loading: false })
   const [reloadSubmissions, setReloadSubmissions] = useState(0)
   const [expandedSubmission, setExpandedSubmission] = useState(-1)
@@ -55,6 +91,127 @@ function App() {
   const resizedRef = useRef(false)
   const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve())
   const [preferenceError, setPreferenceError] = useState('')
+
+  function invalidateResult(id: string) {
+    resultVersions.current[id] = (resultVersions.current[id] ?? 0) + 1
+    setTestResults(current => {
+      if (!current[id]) return current
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+  }
+
+  function updateCustomCases(id: string, cases: CustomCase[]) {
+    invalidateResult(id)
+    setCustomCases(current => ({ ...current, [id]: cases }))
+  }
+
+  function publishDraft(id: string, draft: Draft) {
+    setDrafts(current => ({ ...current, [id]: { ...draft } }))
+  }
+
+  function flushDraft(id: string, keepalive = false) {
+    const draft = draftEntries.current[id]
+    if (!draft || !draft.loaded) return
+    if (draft.timer) {
+      clearTimeout(draft.timer)
+      draft.timer = undefined
+    }
+    if (!draft.dirty) return
+    if (draft.inFlight) {
+      draft.flushKeepalive ||= keepalive
+      return
+    }
+
+    const value = draft.value
+    draft.dirty = false
+    draft.inFlight = true
+    const useKeepalive = keepalive || draft.flushKeepalive
+    draft.flushKeepalive = false
+    draft.status = 'saving'
+    draft.error = ''
+    publishDraft(id, draft)
+    void request<{ answer: string }>(`/api/questions/${encodeURIComponent(id)}/draft`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer: value }), keepalive: useKeepalive,
+    }).then(() => {
+      draft.inFlight = false
+      if (!draft.dirty) {
+        removePendingDraft(id, value)
+        draft.status = 'saved'
+      } else if (!draft.timer) {
+        flushDraft(id, draft.flushKeepalive)
+        return
+      }
+      publishDraft(id, draft)
+    }).catch(error => {
+      draft.inFlight = false
+      draft.dirty = true
+      draft.flushKeepalive = false
+      clearTimeout(draft.timer)
+      draft.timer = undefined
+      draft.status = 'error'
+      draft.error = error instanceof Error ? error.message : 'Could not save draft.'
+      publishDraft(id, draft)
+    })
+  }
+
+  function updateDraft(id: string, value: string, immediate = false) {
+    const draft = draftEntries.current[id]
+    if (!draft?.loaded) return
+    if (draft.value !== value) invalidateResult(id)
+    draft.value = value
+    draft.dirty = true
+    draft.status = 'saving'
+    draft.error = ''
+    storePendingDraft(id, value)
+    clearTimeout(draft.timer)
+    draft.timer = undefined
+    if (immediate) flushDraft(id, true)
+    else {
+      draft.timer = window.setTimeout(() => {
+        draft.timer = undefined
+        flushDraft(id)
+      }, 500)
+      publishDraft(id, draft)
+    }
+  }
+
+  function loadDraft(id: string, starter: string) {
+    const draft: Draft = { value: '', loaded: false, status: 'loading', error: '', dirty: false, inFlight: false, flushKeepalive: false }
+    draftEntries.current[id] = draft
+    publishDraft(id, draft)
+    void request<{ answer: string | null }>(`/api/questions/${encodeURIComponent(id)}/draft`)
+      .then(data => {
+        const pending = readPendingDraft(id)
+        draft.value = pending ?? data.answer ?? starter
+        draft.loaded = true
+        draft.status = pending === null ? (data.answer === null ? 'ready' : 'saved') : 'saving'
+        draft.dirty = pending !== null
+        publishDraft(id, draft)
+        if (draft.dirty) flushDraft(id)
+      })
+      .catch(error => {
+        draft.status = 'error'
+        draft.error = error instanceof Error ? error.message : 'Could not load draft.'
+        publishDraft(id, draft)
+      })
+  }
+
+  useEffect(() => {
+    const flushPending = () => {
+      for (const id of Object.keys(draftEntries.current)) flushDraft(id, true)
+    }
+    window.addEventListener('pagehide', flushPending)
+    const onVisibilityChange = () => { if (document.visibilityState === 'hidden') flushPending() }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      window.removeEventListener('pagehide', flushPending)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      flushPending()
+    }
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -121,9 +278,31 @@ function App() {
   }, [selectedId])
   const activeCategory = selected && category !== 'All topics' && selected.category !== category ? 'All topics' : category
   const filtered = activeCategory === 'All topics' ? questions : questions.filter(q => q.category === activeCategory)
-  const answer = drafts[selectedId] ?? (selected?.coding ? selected.starterCode ?? '' : '')
+  const draft = drafts[selectedId]
+  const answer = draft?.value ?? (selected?.coding ? selected.starterCode ?? '' : '')
   const recentSessions = useMemo(() => [...sessions].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()), [sessions])
   const testResult = testResults[selectedId]?.code === answer ? testResults[selectedId] : undefined
+  const currentCases = customCases[selectedId] ?? []
+  const caseData = testcases[selectedId]
+  const customCasesError = currentCases.length > 10 ? 'You can add at most 10 custom cases.' : currentCases.some(item => new TextEncoder().encode(item.input).length > 8192 || (item.expected !== null && new TextEncoder().encode(item.expected).length > 8192)) ? 'Custom input and expected output must each be at most 8 KiB.' : ''
+
+  useEffect(() => {
+    if (!selected) return
+    const id = selected.id
+    if (!draftEntries.current[id]) loadDraft(id, selected.coding ? selected.starterCode ?? '' : '')
+    return () => flushDraft(id, true)
+  }, [selected?.id])
+
+  useEffect(() => {
+    if (!selected?.coding) return
+    const controller = new AbortController()
+    const id = selected.id
+    setTestcases(current => ({ ...current, [id]: { ...current[id], loading: true, error: '' } }))
+    request<TestcaseData>(`/api/questions/${encodeURIComponent(id)}/testcases`, { signal: controller.signal })
+      .then(data => { if (!controller.signal.aborted) setTestcases(current => ({ ...current, [id]: { data, loading: false, error: '' } })) })
+      .catch(error => { if (!controller.signal.aborted) setTestcases(current => ({ ...current, [id]: { ...current[id], loading: false, error: error instanceof Error ? error.message : 'Could not load test cases.' } })) })
+    return () => controller.abort()
+  }, [selected?.id, selected?.coding, reloadTestcases])
 
   useEffect(() => {
     if (!selected?.coding) return
@@ -138,9 +317,11 @@ function App() {
   }, [selected?.id, selected?.coding, reloadSubmissions])
 
   async function testCode(action: 'run' | 'submit') {
-    if (!selected?.coding || !answer.trim() || testing[selected.id]) return
+    if (!selected?.coding || !draft?.loaded || !answer.trim() || testing[selected.id] || (action === 'run' && (customCasesError || !caseData?.data))) return
     const questionId = selected.id
     const code = answer
+    const version = resultVersions.current[questionId] ?? 0
+    const cases = customCases[questionId] ?? []
     setTesting(current => ({ ...current, [questionId]: action }))
     setTestResults(current => {
       const next = { ...current }
@@ -148,16 +329,16 @@ function App() {
       return next
     })
     try {
-      const result = await request<TestResult>(`/api/questions/${encodeURIComponent(questionId)}/${action}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }),
+      const result = await request<RunResult>(`/api/questions/${encodeURIComponent(questionId)}/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(action === 'run' ? { code, customCases: cases } : { code }),
       })
-      setTestResults(current => ({ ...current, [questionId]: { code, result, action } }))
+      if ((resultVersions.current[questionId] ?? 0) === version) setTestResults(current => ({ ...current, [questionId]: { code, result, action } }))
       if (action === 'submit') {
         setReloadQuestions(n => n + 1)
         setReloadSubmissions(n => n + 1)
       }
     } catch (error) {
-      setTestResults(current => ({ ...current, [questionId]: { code, action, error: error instanceof Error ? error.message : 'Could not execute your code.' } }))
+      if ((resultVersions.current[questionId] ?? 0) === version) setTestResults(current => ({ ...current, [questionId]: { code, action, error: error instanceof Error ? error.message : 'Could not execute your code.' } }))
     } finally {
       setTesting(current => ({ ...current, [questionId]: undefined }))
     }
@@ -172,7 +353,7 @@ function App() {
 
   async function saveAnswer(event: React.FormEvent) {
     event.preventDefault()
-    if (!selected || !answer.trim() || saving) return
+    if (!selected || !draft?.loaded || !answer.trim() || saving) return
     const questionId = selected.id
     setSaving(true)
     setSaveError(null)
@@ -184,7 +365,7 @@ function App() {
       })
       setSessions(current => [session, ...current.filter(item => item.id !== session.id)])
       if (sessionsError) setReloadSessions(n => n + 1)
-      setDrafts(current => ({ ...current, [questionId]: '' }))
+      updateDraft(questionId, '', true)
       setSavedId(questionId)
     } catch (error) {
       setSaveError({ questionId, message: error instanceof Error ? error.message : 'Could not save your answer.' })
@@ -338,24 +519,30 @@ function App() {
             <Code2 size={16} className="text-mint" /><span id="workspace-title">Your answer</span>
           </div>
           {selected ? <form onSubmit={event => { if (selected.coding) { event.preventDefault(); void testCode('submit') } else void saveAnswer(event) }} className="flex flex-1 flex-col p-4">
-            <AnswerEditor key={`${selected.id}-${selected.coding}`} coding={selected.coding} value={answer} disabled={saving || !!testing[selected.id]} onChange={value => { setDrafts(current => ({ ...current, [selected.id]: value })); setSavedId(''); setSaveError(null) }} />
+            {!draft || draft.status === 'loading' ? <Loading label="Loading in-progress draft..." /> : !draft.loaded ? <ErrorState message={`Could not load in-progress draft: ${draft.error}`} retry={() => loadDraft(selected.id, selected.coding ? selected.starterCode ?? '' : '')} /> : <AnswerEditor key={`${selected.id}-${selected.coding}`} coding={selected.coding} value={answer} disabled={saving || !!testing[selected.id]} onChange={value => { updateDraft(selected.id, value); setSavedId(''); setSaveError(null) }} />}
+            {draft?.loaded && <div className="mt-2 text-xs" role={draft.status === 'error' ? 'alert' : 'status'}>
+              {draft.status === 'error' ? <span className="text-[#ff8389]">In progress · Draft not saved: {draft.error} <button type="button" onClick={() => flushDraft(selected.id)} className="font-medium text-purple hover:underline">Try again</button></span> : <span className="text-muted">In progress · {draft.status === 'saving' ? 'Saving draft...' : draft.status === 'ready' ? 'No draft saved yet' : 'Draft saved'}</span>}
+            </div>}
+            {selected.coding && <>{caseData?.loading && !caseData.data && <Loading label="Loading test cases..." />}{caseData?.error && <ErrorState message={caseData.error} retry={() => setReloadTestcases(n => n + 1)} />}{(caseData?.data || testResult?.result) && <TestcaseBrowser key={selected.id} cases={(caseData?.data ?? emptyTestcaseData).cases} template={(caseData?.data ?? emptyTestcaseData).customTemplate} customCases={currentCases} onChange={cases => updateCustomCases(selected.id, cases)} result={testResult?.result} action={testResult?.action} />}</>}
+            {selected.coding && customCasesError && <p role="alert" className="mt-2 text-xs text-[#ff8389]">{customCasesError}</p>}
             <div className="mt-auto flex flex-wrap items-center justify-between gap-3 border-t border-carbon-700 pt-4">
               {selected.coding ? <>
-                <span className="text-xs text-muted">Run tests without saving, or submit to record your attempt.</span>
+                <span className="text-xs text-muted">Run tests without recording a submission, or submit to record your attempt.</span>
                 <div className="flex gap-2">
-                  <Button type="button" disabled={!answer.trim() || !!testing[selected.id]} onClick={() => void testCode('run')}>{testing[selected.id] === 'run' ? 'Running...' : 'Run'}</Button>
-                  <Button type="submit" disabled={!answer.trim() || !!testing[selected.id]}>{testing[selected.id] === 'submit' ? 'Submitting...' : 'Submit'}</Button>
+                  <Button type="button" disabled={!draft?.loaded || !answer.trim() || !!testing[selected.id] || !caseData?.data || !!customCasesError} onClick={() => void testCode('run')}>{testing[selected.id] === 'run' ? 'Running...' : 'Run'}</Button>
+                  <Button type="submit" disabled={!draft?.loaded || !answer.trim() || !!testing[selected.id]}>{testing[selected.id] === 'submit' ? 'Submitting...' : 'Submit'}</Button>
                 </div>
               </> : <>
-                <span className="text-xs text-muted">Saved when you submit</span>
-                <Button disabled={!answer.trim() || saving} type="submit">{saving ? <><LoaderCircle size={15} className="animate-spin" /> Saving...</> : <>Save answer <ArrowRight size={15} /></>}</Button>
+                <span className="text-xs text-muted">Save your answer to your practice history.</span>
+                <Button disabled={!draft?.loaded || !answer.trim() || saving} type="submit">{saving ? <><LoaderCircle size={15} className="animate-spin" /> Saving...</> : <>Save answer <ArrowRight size={15} /></>}</Button>
               </>}
             </div>
             {selected.coding && testResult && <div role={testResult.error || testResult.result?.error ? 'alert' : 'status'} className="mt-3 text-sm">
-              {testResult.error ? <p className="text-[#ff8389]">{testResult.error}</p> : testResult.result && <>
-                <p className={testResult.result.passed ? 'text-mint' : 'text-[#ff8389]'}>{testResult.action === 'submit' ? 'Submission' : 'Run'}: {testResult.result.passed ? 'Passed' : 'Failed'} ({testResult.result.total - testResult.result.failedTestIds.length}/{testResult.result.total} tests passed)</p>
-                {testResult.result.error && <p className="mt-2 whitespace-pre-wrap text-[#ff8389]">{testResult.result.error}</p>}
-                {testResult.result.failedTestIds.length > 0 && <p className="mt-2 break-words text-xs text-muted">Failed test IDs: {testResult.result.failedTestIds.join(', ')}</p>}
+              {testResult.error ? <p className="whitespace-pre-wrap break-all text-[#ff8389]">{testResult.error}</p> : testResult.result && <>
+                <p className={testResult.result.passed ? 'text-mint' : 'text-[#ff8389]'}>{testResult.action === 'submit' ? 'Submission' : 'Sample tests'}: {testResult.result.passed ? 'Passed' : 'Failed'} ({testResult.result.total - testResult.result.failedTestIds.length}/{testResult.result.total} tests passed)</p>
+                {testResult.result.customResults && testResult.result.customResults.length > 0 && <p className="mt-1 text-xs text-muted">Custom cases: {testResult.result.customResults.filter(item => item.passed === true).length} passed, {testResult.result.customResults.filter(item => item.passed === false).length} failed, {testResult.result.customResults.filter(item => item.passed === null).length} unjudged</p>}
+                {testResult.result.error && <p className="mt-2 whitespace-pre-wrap break-all text-[#ff8389]">{testResult.result.error}</p>}
+                {testResult.result.failures == null && <p className="mt-2 text-xs text-muted">Diagnostic details are unavailable for this result.</p>}
               </>}
             </div>}
             {!selected.coding && saveError?.questionId === selected.id && <p role="alert" className="mt-3 text-sm text-[#ff8389]">{saveError.message}</p>}
@@ -367,9 +554,9 @@ function App() {
                   <span>{submission.passed ? 'Passed' : 'Failed'} · {formatDate(submission.createdAt)} · {submission.total - submission.failedTestIds.length}/{submission.total} tests passed</span><ChevronDown size={14} />
                 </button>
                 {expandedSubmission === index && <div className="border-t border-carbon-700 px-3 py-3 text-xs text-muted">
-                  {submission.failedTestIds.length > 0 && <p className="mb-2 break-words">Failed test IDs: {submission.failedTestIds.join(', ')}</p>}
-                  {submission.error && <p className="mb-2 whitespace-pre-wrap">{submission.error}</p>}
-                  <pre className="overflow-auto whitespace-pre-wrap break-words">{submission.code}</pre>
+                  {submission.error && <p className="mb-2 whitespace-pre-wrap break-all">{submission.error}</p>}
+                  <FailureDetails result={submission} cases={caseData?.data?.cases ?? []} />
+                  <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-all">{submission.code}</pre>
                 </div>}
               </div>)}</div>}
             </div>}
@@ -381,6 +568,33 @@ function App() {
       </Routes>
     </div>
   )
+}
+
+function FailureDetails({ result, cases }: { result: TestResult; cases: CanonicalCase[] }) {
+  if (result.failures == null) {
+    return <p className="mt-2 text-xs text-muted">Diagnostic details are unavailable for this submission.</p>
+  }
+  if (result.failures.length === 0) return null
+
+  return <div className="mt-2 space-y-3 text-xs text-muted">
+    {result.failures.map((failure, index) => <div key={`${failure.id}-${index}`} className="min-w-0 rounded-md border border-carbon-700 p-3">
+      <p className="mb-2 font-medium text-ink">Failed test {index + 1}</p>
+      <dl className="space-y-2">
+        {([['Input', caseInput(cases.find(item => item.id === failure.id)?.input ?? failure.input)], ['Expected', failure.expected], ['Actual', failure.actual]] as const).map(([label, value]) => <div key={label} className="min-w-0">
+          <dt className="font-medium text-ink">{label}</dt>
+          <dd><pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all">{value}</pre></dd>
+        </div>)}
+      </dl>
+    </div>)}
+  </div>
+}
+
+function caseInput(input: string) {
+  try {
+    const value: unknown = JSON.parse(input)
+    if (value && typeof value === 'object' && !Array.isArray(value)) return JSON.stringify(value, null, 2)
+  } catch { /* Older submissions may contain Python test code. */ }
+  return 'Structured input unavailable for this test.'
 }
 
 function HomePage() {

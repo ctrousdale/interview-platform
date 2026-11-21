@@ -4,6 +4,7 @@ The parent supplies JSON on stdin. No submitted code runs until both kernel
 restrictions are installed. Exit 42 means the test passed; 1 means it failed;
 125 means isolation could not be established.
 """
+import ast
 import ctypes
 import json
 import os
@@ -91,9 +92,142 @@ def isolate():
         seccomp.seccomp_release(ctx)
 
 
+def instrument(source):
+    """Record already-evaluated values without calling user-defined repr methods."""
+    class Recorder(ast.NodeTransformer):
+        def visit_Assert(self, node):
+            expression = ast.get_source_segment(source, node.test) or "assertion"
+            node = self.generic_visit(node)
+            marker = ast.Expr(ast.Call(ast.Name("__diagnostic_assert__", ast.Load()),
+                                       [ast.Constant(expression)], []))
+            return [ast.copy_location(marker, node), node]
+
+        def visit_Call(self, node):
+            text = ast.get_source_segment(source, node) or "call"
+            node = self.generic_visit(node)
+            return ast.copy_location(ast.Call(ast.Name("__diagnostic_value__", ast.Load()),
+                                              [ast.Constant(text), node], []), node)
+
+        def visit_Name(self, node):
+            if not isinstance(node.ctx, ast.Load):
+                return node
+            return ast.copy_location(ast.Call(ast.Name("__diagnostic_value__", ast.Load()),
+                                              [ast.Constant(node.id), node], []), node)
+
+    return compile(ast.fix_missing_locations(Recorder().visit(ast.parse(source, "<test>"))),
+                   "<test>", "exec")
+
+
+def safe_value(value, depth=0):
+    """Format only exact builtins, with bounded traversal and no user callbacks."""
+    kind = type(value)
+    if kind is str:
+        return repr(value[:300]) + ("…" if len(value) > 300 else "")
+    if kind is bytes:
+        return repr(value[:150]) + ("…" if len(value) > 150 else "")
+    if kind in (int, float, bool, type(None)):
+        try:
+            return repr(value)[:300]
+        except ValueError:
+            return "<integer too large to display>"
+    if depth < 2 and kind in (list, tuple, dict, set, frozenset):
+        items = []
+        if kind is dict:
+            for index, (key, item) in enumerate(value.items()):
+                if index == 8:
+                    break
+                items.append(safe_value(key, depth + 1) + ": " + safe_value(item, depth + 1))
+            return "{" + ", ".join(items) + (", …" if len(value) > 8 else "") + "}"
+        for index, item in enumerate(value):
+            if index == 8:
+                break
+            items.append(safe_value(item, depth + 1))
+        return kind.__name__ + "([" + ", ".join(items) + (", …" if len(value) > 8 else "") + "])"
+    return "<non-primitive value>"
+
+
+def json_value(value, depth=0, budget=None):
+    """Copy JSON-compatible exact builtins without invoking submitted methods."""
+    if budget is None:
+        budget = [10000]
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 100:
+        raise ValueError("Return value is too large or deeply nested")
+    kind = type(value)
+    if kind in (str, int, float, bool, type(None)):
+        return value
+    if kind in (list, tuple):
+        return [json_value(item, depth + 1, budget) for item in value]
+    if kind is dict:
+        if any(type(key) is not str for key in value):
+            raise TypeError("Return object keys must be strings")
+        return {key: json_value(item, depth + 1, budget) for key, item in value.items()}
+    raise TypeError("Return value is not JSON-compatible")
+
+
+def json_equal(actual, expected):
+    """Compare JSON values without treating booleans as numbers."""
+    if type(actual) is bool or type(expected) is bool:
+        return type(actual) is bool and type(expected) is bool and actual == expected
+    if type(actual) is list and type(expected) is list:
+        return len(actual) == len(expected) and all(json_equal(a, b) for a, b in zip(actual, expected))
+    if type(actual) is dict and type(expected) is dict:
+        return actual.keys() == expected.keys() and all(json_equal(actual[k], expected[k]) for k in actual)
+    return actual == expected
+
+
+def reject_json_constant(value):
+    raise ValueError("Invalid JSON constant: " + value)
+
+
+def diagnostics(fd, initial_expected):
+    history = []
+    expected = initial_expected
+    count = 0
+
+    def emit(actual):
+        nonlocal count
+        if count >= 100:
+            return
+        count += 1
+        message = json.dumps({"expected": expected[:400], "actual": actual[:500]},
+                             ensure_ascii=False).encode("utf-8", "backslashreplace") + b"\n"
+        try:
+            os.write(fd, message)
+        except OSError:
+            pass
+
+    def assertion(expression):
+        nonlocal expected
+        expected = expression
+        emit("Evaluating assertion. Observed: " + "; ".join(history[-2:]))
+
+    def value(expression, result):
+        history.append(expression[:60] + " = " + safe_value(result)[:120])
+        del history[:-8]
+        return result
+
+    def failure(exc):
+        kind = type(exc)
+        name = type.__getattribute__(kind, "__name__")
+        detail = safe_value(BaseException.args.__get__(exc))
+        emit("Raised " + name + (" " + detail if detail else "") +
+             ". Observed: " + "; ".join(history[-2:]))
+
+    return assertion, value, failure
+
+
 def main():
     payload = json.load(sys.stdin)
-    # stdout/stderr are /dev/null and stdin is exhausted before isolation.
+    diagnostic_fd = os.dup(1)
+    os.set_blocking(diagnostic_fd, False)
+    null_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null_fd, 1)
+    os.close(null_fd)
+    custom = payload.get("custom")
+    test_code = None if custom is not None else instrument(payload["test"])
+    assertion, value, failure = diagnostics(diagnostic_fd, payload.get("expected") or "")
+    # User stdout/stderr are /dev/null and stdin is exhausted before isolation.
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
     resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024,) * 2)
@@ -103,11 +237,53 @@ def main():
         isolate()
     except Exception:
         os._exit(125)
+    if custom is not None:
+        try:
+            custom_input = json.loads(custom["input"], parse_constant=reject_json_constant)
+            if type(custom_input) is not dict:
+                raise ValueError("Custom input must be a JSON object")
+            expected_text = custom.get("expected")
+            expected = (json.loads(expected_text, parse_constant=reject_json_constant)
+                        if expected_text is not None else None)
+            scenarios = custom_input.get("scenarios")
+            if "scenarios" in custom_input:
+                if (type(scenarios) is not list
+                        or any(type(scenario) is not dict for scenario in scenarios)):
+                    raise ValueError("scenarios must be an array of JSON objects")
+            else:
+                scenarios = [custom_input]
+            solution = compile(payload["code"], "<solution>", "exec")
+            harness = compile(payload["harness"], "<custom harness>", "exec")
+            results = []
+            for scenario in scenarios:
+                namespace = {"__name__": "__main__"}
+                exec(solution, namespace)
+                namespace["custom_input"] = scenario
+                exec(harness, namespace)
+                results.append(json_value(namespace["custom_actual"]))
+            actual = results if "scenarios" in custom_input else results[0]
+            displayed = json.dumps(actual, ensure_ascii=True, allow_nan=False)
+            if len(displayed) > 2000:
+                raise ValueError("Return value is too large to display")
+            passed = json_equal(actual, expected) if expected_text is not None else None
+            result = {"actual": displayed, "passed": passed, "error": None}
+        except BaseException as exc:
+            name = type.__getattribute__(type(exc), "__name__")
+            detail = safe_value(BaseException.args.__get__(exc))
+            result = {"actual": "", "passed": False,
+                      "error": (name + (": " + detail if detail else ""))[:400]}
+        try:
+            os.write(diagnostic_fd, json.dumps(result, ensure_ascii=False).encode("utf-8", "backslashreplace"))
+        except OSError:
+            pass
+        os._exit(42)
     try:
-        namespace = {"__name__": "__main__"}
+        namespace = {"__name__": "__main__", "__diagnostic_assert__": assertion,
+                     "__diagnostic_value__": value}
         exec(compile(payload["code"], "<solution>", "exec"), namespace)
-        exec(compile(payload["test"], "<test>", "exec"), namespace)
-    except BaseException:
+        exec(test_code, namespace)
+    except BaseException as exc:
+        failure(exc)
         os._exit(1)
     os._exit(42)
 

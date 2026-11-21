@@ -50,11 +50,71 @@ app.MapGet("/api/questions", async (NpgsqlDataSource db, HttpClient python, Canc
     return Results.Ok(questions);
 });
 
+app.MapGet("/api/questions/{id}/testcases", async (string id, NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken) =>
+{
+    var knownId = await FindCodingQuestionAsync(db, id, cancellationToken);
+    if (knownId is null)
+        return Results.NotFound();
+
+    TestcaseMetadata? metadata;
+    try
+    {
+        using var response = await python.GetAsync($"/python/testcases/{Uri.EscapeDataString(knownId)}", cancellationToken);
+        response.EnsureSuccessStatusCode();
+        metadata = await response.Content.ReadFromJsonAsync<TestcaseMetadata>(cancellationToken);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or JsonException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+    {
+        return Results.Problem("The coding test service is unavailable.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    if (metadata?.Cases is null || metadata.CustomTemplate is null ||
+        metadata.CustomTemplate.Description is null || metadata.CustomTemplate.Input is null ||
+        metadata.Cases.Any(c => c is null || string.IsNullOrWhiteSpace(c.Id) || c.Input is null || c.Sample is null) ||
+        metadata.Cases.Select(c => c.Id).Distinct(StringComparer.Ordinal).Count() != metadata.Cases.Length)
+        return Results.Problem("The coding test service returned invalid testcase metadata.", statusCode: StatusCodes.Status502BadGateway);
+
+    return Results.Ok(metadata);
+});
+
 app.MapPost("/api/questions/{id}/run", async (string id, CodeRequest request, NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken) =>
     await ExecuteCodeAsync(id, request, false, db, python, cancellationToken));
 
 app.MapPost("/api/questions/{id}/submit", async (string id, CodeRequest request, NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken) =>
     await ExecuteCodeAsync(id, request, true, db, python, cancellationToken));
+
+app.MapGet("/api/questions/{id}/draft", async (string id, NpgsqlDataSource db, CancellationToken cancellationToken) =>
+{
+    await using var command = db.CreateCommand("""
+        SELECT d.answer FROM questions q
+        LEFT JOIN question_drafts d ON d.question_id = q.id
+        WHERE q.id = @id
+        """);
+    command.Parameters.AddWithValue("id", id);
+    await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+    if (!await reader.ReadAsync(cancellationToken))
+        return Results.NotFound();
+    return Results.Ok(new DraftResponse(reader.IsDBNull(0) ? null : reader.GetString(0)));
+});
+
+app.MapPut("/api/questions/{id}/draft", async (string id, DraftRequest request, NpgsqlDataSource db, CancellationToken cancellationToken) =>
+{
+    if (request.Answer is null)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["answer"] = ["Answer is required."] });
+    if (request.Answer.Length > 204800)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["answer"] = ["Answer must be 204,800 characters or fewer."] });
+
+    await using var command = db.CreateCommand("""
+        INSERT INTO question_drafts (question_id, answer)
+        SELECT id, @answer FROM questions WHERE id = @id
+        ON CONFLICT (question_id) DO UPDATE SET answer = EXCLUDED.answer
+        RETURNING answer
+        """);
+    command.Parameters.AddWithValue("id", id);
+    command.Parameters.AddWithValue("answer", request.Answer);
+    var answer = (string?)await command.ExecuteScalarAsync(cancellationToken);
+    return answer is null ? Results.NotFound() : Results.Ok(new DraftResponse(answer));
+});
 
 app.MapGet("/api/questions/{id}/submissions", async (string id, NpgsqlDataSource db, CancellationToken cancellationToken) =>
 {
@@ -62,12 +122,13 @@ app.MapGet("/api/questions/{id}/submissions", async (string id, NpgsqlDataSource
     if (knownId is null)
         return Results.NotFound();
     var submissions = new List<CodingSubmission>();
-    await using var command = db.CreateCommand($"SELECT code, passed, total, failed_test_ids, error, created_at FROM {SubmissionTable(knownId)} ORDER BY created_at DESC, id DESC");
+    await using var command = db.CreateCommand($"SELECT code, passed, total, failed_test_ids, error, created_at, failures FROM {SubmissionTable(knownId)} ORDER BY created_at DESC, id DESC");
     await using var reader = await command.ExecuteReaderAsync(cancellationToken);
     while (await reader.ReadAsync(cancellationToken))
         submissions.Add(new CodingSubmission(reader.GetString(0), reader.GetBoolean(1), reader.GetInt32(2),
             reader.GetFieldValue<Guid[]>(3).Select(g => g.ToString()).ToArray(),
-            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetFieldValue<DateTime>(5)));
+            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetFieldValue<DateTime>(5),
+            reader.IsDBNull(6) ? null : JsonSerializer.Deserialize<TestFailure[]>(reader.GetString(6))));
     return Results.Ok(submissions);
 });
 
@@ -174,6 +235,15 @@ static async Task<IResult> ExecuteCodeAsync(string id, CodeRequest request, bool
 {
     if (request.Code is null)
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["code"] = ["Code is required."] });
+    if (submit && request.CustomCases is { Length: > 0 })
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["customCases"] = ["Custom cases are only allowed when running code."] });
+    if (request.CustomCases is { } customCases &&
+        (customCases.Length > 10 ||
+         customCases.Any(c => c is null || !Guid.TryParse(c.Id, out _) || c.Input is null ||
+             Encoding.UTF8.GetByteCount(c.Input) > 8192 ||
+             (c.Expected is not null && Encoding.UTF8.GetByteCount(c.Expected) > 8192)) ||
+         customCases.Select(c => Guid.Parse(c.Id)).Distinct().Count() != customCases.Length))
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["customCases"] = ["Provide at most 10 cases with unique UUID ids and inputs and expected values no larger than 8 KiB each."] });
     var knownId = await FindCodingQuestionAsync(db, id, cancellationToken);
     if (knownId is null)
         return Results.NotFound();
@@ -181,7 +251,9 @@ static async Task<IResult> ExecuteCodeAsync(string id, CodeRequest request, bool
     RunResult? result;
     try
     {
-        using var response = await python.PostAsJsonAsync("/python/execute", new { questionId = knownId, code = request.Code, mode = submit ? "submit" : "run" }, cancellationToken);
+        using var response = submit
+            ? await python.PostAsJsonAsync("/python/execute", new { questionId = knownId, code = request.Code, mode = "submit" }, cancellationToken)
+            : await python.PostAsJsonAsync("/python/execute", new { questionId = knownId, code = request.Code, mode = "run", customCases = request.CustomCases ?? [] }, cancellationToken);
         response.EnsureSuccessStatusCode();
         result = await response.Content.ReadFromJsonAsync<RunResult>(cancellationToken);
     }
@@ -189,16 +261,33 @@ static async Task<IResult> ExecuteCodeAsync(string id, CodeRequest request, bool
     {
         return Results.Problem("The coding test service is unavailable.", statusCode: StatusCodes.Status503ServiceUnavailable);
     }
-    if (result is null || result.Total <= 0 || result.FailedTestIds is null ||
+    if (result is null || result.Total <= 0 || result.FailedTestIds is null || result.Failures is null ||
+        result.FailedTestIds.Length > result.Total ||
         result.FailedTestIds.Any(id => !Guid.TryParse(id, out _)) ||
-        (result.Passed && (result.FailedTestIds.Length != 0 || result.Error is not null)))
+        result.FailedTestIds.Select(Guid.Parse).Distinct().Count() != result.FailedTestIds.Length ||
+        result.Failures.Length != result.FailedTestIds.Length ||
+        result.Failures.Any(f => f is null || !Guid.TryParse(f.Id, out _) ||
+            f.Input is null || f.Expected is null || f.Actual is null) ||
+        !result.Failures.Select(f => Guid.Parse(f.Id)).ToHashSet().SetEquals(result.FailedTestIds.Select(Guid.Parse)) ||
+        (result.Passed && (result.FailedTestIds.Length != 0 || result.Error is not null)) ||
+        (!result.Passed && result.FailedTestIds.Length == 0 && result.Error is null))
         return Results.Problem("The coding test service returned an invalid result.", statusCode: StatusCodes.Status502BadGateway);
+
+    if (!submit && request.CustomCases is { Length: > 0 } requestedCases)
+    {
+        if (result.CustomResults is null || result.CustomResults.Length != requestedCases.Length ||
+            result.CustomResults.Any(r => r is null || r.Id is null || r.Input is null || r.Actual is null ||
+                (r.Error is not null ? r.Passed != false : (r.Expected is null) != (r.Passed is null))) ||
+            result.CustomResults.Select(r => r.Id).Distinct(StringComparer.Ordinal).Count() != requestedCases.Length ||
+            result.CustomResults.Any(r => !requestedCases.Any(c => c.Id == r.Id && c.Input == r.Input && c.Expected == r.Expected)))
+            return Results.Problem("The coding test service returned invalid custom results.", statusCode: StatusCodes.Status502BadGateway);
+    }
 
     if (submit)
     {
         await using var command = db.CreateCommand($"""
-            INSERT INTO {SubmissionTable(knownId)} (id, code, passed, total, failed_test_ids, error, created_at)
-            VALUES (@id, @code, @passed, @total, @failed_test_ids, @error, @created_at)
+            INSERT INTO {SubmissionTable(knownId)} (id, code, passed, total, failed_test_ids, error, created_at, failures)
+            VALUES (@id, @code, @passed, @total, @failed_test_ids, @error, @created_at, @failures)
             """);
         command.Parameters.AddWithValue("id", Guid.NewGuid());
         command.Parameters.AddWithValue("code", request.Code);
@@ -206,6 +295,7 @@ static async Task<IResult> ExecuteCodeAsync(string id, CodeRequest request, bool
         command.Parameters.AddWithValue("total", result.Total);
         command.Parameters.AddWithValue("failed_test_ids", result.FailedTestIds.Select(Guid.Parse).ToArray());
         command.Parameters.AddWithValue("error", NpgsqlDbType.Text, (object?)result.Error ?? DBNull.Value);
+        command.Parameters.AddWithValue("failures", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(result.Failures));
         command.Parameters.AddWithValue("created_at", NpgsqlDbType.TimestampTz, DateTime.UtcNow);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -236,6 +326,10 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
                     created_at timestamptz NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS ix_sessions_created_at ON sessions (created_at DESC);
+                CREATE TABLE IF NOT EXISTS question_drafts (
+                    question_id text PRIMARY KEY REFERENCES questions(id),
+                    answer text NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS user_preferences (
                     id integer PRIMARY KEY CHECK (id = 1),
                     description_width double precision NOT NULL CHECK (description_width >= 20 AND description_width <= 80)
@@ -289,8 +383,10 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
                         total integer NOT NULL,
                         failed_test_ids uuid[] NOT NULL,
                         error text,
-                        created_at timestamptz NOT NULL
-                    )
+                        created_at timestamptz NOT NULL,
+                        failures jsonb
+                    );
+                    ALTER TABLE {SubmissionTable(id)} ADD COLUMN IF NOT EXISTS failures jsonb
                     """, connection, transaction);
                 await create.ExecuteNonQueryAsync(cancellationToken);
             }
@@ -308,10 +404,18 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
 
 record Question(string Id, string Category, string Difficulty, string Title, string Prompt, bool Coding, bool Complete, string? StarterCode, string? TestInstructions);
 record SuiteMetadata(string Id, string StarterCode, string TestInstructions);
-record CodeRequest(string? Code);
-record RunResult(bool Passed, int Total, string[] FailedTestIds, string? Error);
-record CodingSubmission(string Code, bool Passed, int Total, string[] FailedTestIds, string? Error, DateTime CreatedAt);
+record Testcase(string Id, string Input, bool? Sample);
+record CustomTemplate(string Description, string Input);
+record TestcaseMetadata(Testcase[] Cases, CustomTemplate CustomTemplate);
+record CustomCase(string Id, string Input, string? Expected);
+record CustomResult(string Id, string Input, string? Expected, string Actual, bool? Passed, string? Error);
+record CodeRequest(string? Code, CustomCase[]? CustomCases);
+record TestFailure(string Id, string Input, string Expected, string Actual);
+record RunResult(bool Passed, int Total, string[] FailedTestIds, string? Error, TestFailure[] Failures, CustomResult[]? CustomResults = null);
+record CodingSubmission(string Code, bool Passed, int Total, string[] FailedTestIds, string? Error, DateTime CreatedAt, TestFailure[]? Failures);
 record Session(string Id, string QuestionId, string QuestionTitle, string Category, string Answer, DateTime CreatedAt);
 record CreateSessionRequest(string? QuestionId, string? Answer);
+record DraftRequest(string? Answer);
+record DraftResponse(string? Answer);
 record Preferences(double DescriptionWidth);
 record PreferencesRequest(double? DescriptionWidth);

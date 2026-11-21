@@ -7,16 +7,33 @@ from pathlib import Path
 import signal
 import tempfile
 import sys
-
-import suites
+from uuid import UUID
 
 from aiohttp import web
+
+import suites
+from canonical_algorithms import CANONICAL_INPUTS as ALGORITHM_INPUTS
+from canonical_patterns import CANONICAL_INPUTS as PATTERN_INPUTS
+
+assert not ALGORITHM_INPUTS.keys() & PATTERN_INPUTS.keys()
+CANONICAL_INPUTS = {**ALGORITHM_INPUTS, **PATTERN_INPUTS}
+assert CANONICAL_INPUTS.keys() == suites.SUITES.keys()
+assert all(len(CANONICAL_INPUTS[question_id]) == len(suite["tests"])
+           and all(type(value) is dict for value in CANONICAL_INPUTS[question_id])
+           for question_id, suite in suites.SUITES.items())
+
+
+def canonical_input(question_id, index):
+    return json.dumps(CANONICAL_INPUTS[question_id][index], ensure_ascii=True, allow_nan=False)
+
 
 MAX_BODY = 256 * 1024
 MAX_SOURCE = 200 * 1024
 MAX_FRAME = 8 * 1024 * 1024
 MAX_CONCURRENT = 4
 REQUEST_TIMEOUT = 15
+MAX_CUSTOM_CASES = 10
+MAX_CUSTOM_VALUE = 8 * 1024
 PROCESS_ENV = {
     "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
     "HOME": "/tmp",
@@ -222,6 +239,18 @@ async def suite_metadata(request):
         for question_id, suite in suites.SUITES.items()
     ])
 
+async def testcase_metadata(request):
+    question_id = request.match_info["id"]
+    suite = suites.SUITES.get(question_id)
+    fixture = suites.CUSTOM_CASES.get(question_id)
+    if suite is None or fixture is None:
+        raise web.HTTPNotFound(text="Unknown coding question")
+    return web.json_response({
+        "cases": [{"id": test["id"], "input": canonical_input(question_id, index), "sample": test["run"]}
+                  for index, test in enumerate(suite["tests"])],
+        "customTemplate": {"description": fixture["description"], "input": fixture["input"]},
+    })
+
 
 async def execute(request):
     try:
@@ -229,6 +258,86 @@ async def execute(request):
             return await execute_inner(request)
     except TimeoutError:
         raise web.HTTPServiceUnavailable(text="Python execution capacity timed out")
+
+
+async def read_diagnostics(stream):
+    """Drain even hostile output while retaining only bounded diagnostic records."""
+    buffer = b""
+    latest = None
+    records = 0
+    discarding = False
+    while chunk := await stream.read(4096):
+        for part in chunk.splitlines(keepends=True):
+            complete = part.endswith(b"\n")
+            if not discarding:
+                buffer += part
+                if len(buffer) > 4096:
+                    buffer = b""
+                    discarding = True
+                elif complete and records < 200:
+                    records += 1
+                    try:
+                        record = json.loads(buffer)
+                        if (isinstance(record, dict) and
+                                isinstance(record.get("expected"), str) and
+                                isinstance(record.get("actual"), str)):
+                            latest = {"expected": record["expected"][:1000],
+                                      "actual": record["actual"][:2000]}
+                    except (ValueError, UnicodeDecodeError):
+                        pass
+            if complete:
+                buffer = b""
+                discarding = False
+    return latest
+
+def validate_custom_cases(value):
+    if not isinstance(value, list) or len(value) > MAX_CUSTOM_CASES:
+        raise web.HTTPBadRequest(text="customCases must be an array of at most 10 cases")
+    seen = set()
+    for case in value:
+        if not isinstance(case, dict):
+            raise web.HTTPBadRequest(text="Each custom case must be an object")
+        case_id = case.get("id")
+        try:
+            if not isinstance(case_id, str):
+                raise ValueError
+            normalized = UUID(case_id)
+            if str(normalized) != case_id.lower() or normalized in seen:
+                raise ValueError
+            seen.add(normalized)
+        except ValueError:
+            raise web.HTTPBadRequest(text="Custom case IDs must be unique UUIDs")
+        for field in ("input", "expected"):
+            item = case.get(field)
+            if field == "expected" and item is None:
+                continue
+            if not isinstance(item, str):
+                raise web.HTTPBadRequest(text=f"Custom case {field} must be a string")
+            try:
+                size = len(item.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise web.HTTPBadRequest(text=f"Custom case {field} must contain valid Unicode")
+            if size > MAX_CUSTOM_VALUE:
+                raise web.HTTPBadRequest(text=f"Custom case {field} is too large")
+    return value
+
+
+async def read_custom_result(stream):
+    # Drain all output even if the process emits malformed or excessive data.
+    data = bytearray()
+    while chunk := await stream.read(4096):
+        if len(data) < 8192:
+            data.extend(chunk[:8192 - len(data)])
+    try:
+        result = json.loads(data)
+        if (isinstance(result, dict) and isinstance(result.get("actual"), str)
+                and (result.get("passed") is None or type(result["passed"]) is bool)
+                and (result.get("error") is None or isinstance(result["error"], str))):
+            return {"actual": result["actual"][:2000], "passed": result["passed"],
+                    "error": result["error"][:1000] if result["error"] else None}
+    except (ValueError, UnicodeDecodeError, KeyError):
+        pass
+    return None
 
 
 async def execute_inner(request):
@@ -251,42 +360,106 @@ async def execute_inner(request):
         raise web.HTTPNotFound(text="Unknown coding question")
     if mode not in ("run", "submit"):
         raise web.HTTPBadRequest(text="mode must be run or submit")
-    tests = [test for test in suites.SUITES[question_id]["tests"]
+    custom_cases = validate_custom_cases(payload.get("customCases", [])) if mode == "run" else []
+    if custom_cases and question_id not in suites.CUSTOM_CASES:
+        raise web.HTTPServiceUnavailable(text="No custom case harness configured")
+    tests = [(index, test) for index, test in enumerate(suites.SUITES[question_id]["tests"])
              if mode == "submit" or test["run"]]
     if not tests:
         raise web.HTTPServiceUnavailable(text="No tests configured")
 
-    failed = []
+    failures = []
     error = None
+    custom_results = []
     async with request.app["slots"]:
         deadline = asyncio.get_running_loop().time() + 20
-        for test in tests:
+        for index, test in tests:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                failed.append(test["id"])
+                failures.append({"id": test["id"], "input": canonical_input(question_id, index),
+                                 "expected": suites.SUITES[question_id]["testInstructions"][:1000]
+                                             or "All assertions in the test pass",
+                                 "actual": "Not executed: execution deadline exceeded"})
                 error = "Execution timed out"
                 continue
             process = await asyncio.create_subprocess_exec(
                 sys.executable, "-I", str(Path(__file__).with_name("executor.py")),
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL, cwd="/", env=PROCESS_ENV,
                 start_new_session=True,
             )
+            reader = asyncio.create_task(read_diagnostics(process.stdout))
+            timed_out = False
             try:
-                data = json.dumps({"code": code, "test": test["code"]}).encode("utf-8")
+                data = json.dumps({"code": code, "test": test["code"],
+                                   "expected": suites.SUITES[question_id]["testInstructions"]
+                                               or "All assertions in the test pass"}).encode("utf-8")
+                process.stdin.write(data)
+                await process.stdin.drain()
+                process.stdin.close()
                 try:
-                    await asyncio.wait_for(process.communicate(data), timeout=min(3, remaining))
+                    await asyncio.wait_for(process.wait(), timeout=min(3, remaining))
                 except TimeoutError:
-                    failed.append(test["id"])
+                    timed_out = True
                     error = "Execution timed out"
-                    continue
-                if process.returncode == 125:
-                    raise web.HTTPServiceUnavailable(text="Python sandbox unavailable")
-                if process.returncode != 42:
-                    failed.append(test["id"])
             finally:
                 await stop_process(process)
-    result = {"passed": not failed, "total": len(tests), "failedTestIds": failed}
+                diagnostic = await reader
+            if process.returncode == 125:
+                raise web.HTTPServiceUnavailable(text="Python sandbox unavailable")
+            if timed_out or process.returncode != 42:
+                actual = diagnostic["actual"] if diagnostic else "No diagnostic output was produced"
+                if timed_out:
+                    actual = "Execution timed out. " + actual
+                elif process.returncode < 0:
+                    actual = f"Execution terminated by signal {-process.returncode}. " + actual
+                failures.append({"id": test["id"], "input": canonical_input(question_id, index),
+                                 "expected": diagnostic["expected"] if diagnostic else
+                                             suites.SUITES[question_id]["testInstructions"][:1000]
+                                             or "All assertions in the test pass",
+                                 "actual": actual})
+        for case in custom_cases:
+            entry = {"id": case["id"], "input": case["input"], "expected": case.get("expected")}
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                entry.update(actual="", passed=False, error="Execution deadline exceeded")
+                custom_results.append(entry)
+                continue
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-I", str(Path(__file__).with_name("executor.py")),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL, cwd="/", env=PROCESS_ENV,
+                start_new_session=True,
+            )
+            reader = asyncio.create_task(read_custom_result(process.stdout))
+            timed_out = False
+            try:
+                data = json.dumps({"code": code, "custom": case,
+                                   "harness": suites.CUSTOM_CASES[question_id]["code"]}).encode("utf-8")
+                process.stdin.write(data)
+                await process.stdin.drain()
+                process.stdin.close()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=min(3, remaining))
+                except TimeoutError:
+                    timed_out = True
+            finally:
+                await stop_process(process)
+                custom_result = await reader
+            if process.returncode == 125:
+                raise web.HTTPServiceUnavailable(text="Python sandbox unavailable")
+            if timed_out:
+                custom_result = {"actual": "", "passed": False, "error": "Execution timed out"}
+            elif process.returncode != 42 or custom_result is None:
+                message = (f"Execution terminated by signal {-process.returncode}"
+                           if process.returncode < 0 else "Execution failed without a result")
+                custom_result = {"actual": "", "passed": False, "error": message}
+            entry.update(custom_result)
+            custom_results.append(entry)
+    result = {"passed": not failures, "total": len(tests),
+              "failedTestIds": [failure["id"] for failure in failures], "failures": failures}
+    if mode == "run":
+        result["customResults"] = custom_results
     if error:
         result["error"] = error
     return web.json_response(result)
@@ -298,6 +471,7 @@ def create_app():
     app["slots"] = asyncio.Semaphore(MAX_CONCURRENT)
     app.router.add_post("/python/{method:format|diagnostics|completion}", handle)
     app.router.add_get("/python/suites", suite_metadata)
+    app.router.add_get("/python/testcases/{id}", testcase_metadata)
     app.router.add_post("/python/execute", execute)
     return app
 

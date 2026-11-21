@@ -7,6 +7,7 @@ import { python } from '@codemirror/lang-python'
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint'
 import { Compartment, EditorState } from '@codemirror/state'
 import { EditorView, keymap, placeholder } from '@codemirror/view'
+import { vim } from '@replit/codemirror-vim'
 
 type Position = { line: number; character: number }
 type ServerDiagnostic = { range: { start: Position; end: Position }; severity?: number; message: string; source?: string }
@@ -37,6 +38,9 @@ const theme = EditorView.theme({
 
 export function AnswerEditor({ value, onChange, disabled, coding = false }: { value: string; onChange: (value: string) => void; disabled: boolean; coding?: boolean }) {
   const [mode, setMode] = useState<'text' | 'python'>(coding ? 'python' : 'text')
+  const [vimEnabled, setVimEnabled] = useState(() => {
+    try { return localStorage.getItem('answer-editor-vim') === 'true' } catch { return false }
+  })
   const [formatter, setFormatter] = useState(false)
   const [lsp, setLsp] = useState(false)
   const [formatStatus, setFormatStatus] = useState('')
@@ -49,6 +53,7 @@ export function AnswerEditor({ value, onChange, disabled, coding = false }: { va
   const language = useRef(new Compartment()).current
   const editable = useRef(new Compartment()).current
   const completion = useRef(new Compartment()).current
+  const vimKeys = useRef(new Compartment()).current
   const formatRequest = useRef<AbortController | null>(null)
   const diagnosticsRequest = useRef<AbortController | null>(null)
   const completionRequest = useRef<AbortController | null>(null)
@@ -59,7 +64,7 @@ export function AnswerEditor({ value, onChange, disabled, coding = false }: { va
       state: EditorState.create({
         doc: value,
         extensions: [
-          basicSetup, theme, placeholder('Start writing your answer here...'),
+          vimKeys.of([]), basicSetup, theme, placeholder('Start writing your answer here...'),
           keymap.of([indentWithTab]), indentUnit.of('    '),
           EditorView.domEventHandlers({
             mousedown(event, editor) {
@@ -106,6 +111,10 @@ export function AnswerEditor({ value, onChange, disabled, coding = false }: { va
       syncingValue.current = false
     }
   }, [value])
+
+  useEffect(() => {
+    view.current?.dispatch({ effects: vimKeys.reconfigure(vimEnabled ? vim() : []) })
+  }, [vimEnabled, vimKeys])
 
   useEffect(() => {
     if (disabled) {
@@ -198,6 +207,11 @@ export function AnswerEditor({ value, onChange, disabled, coding = false }: { va
   return <div>
     <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted">
       {coding ? <span>Python</span> : <label className="flex items-center gap-2">Answer mode <select value={mode} disabled={disabled} onChange={event => { formatRequest.current?.abort(); diagnosticsRequest.current?.abort(); completionRequest.current?.abort(); setFormatStatus(''); setMode(event.target.value as 'text' | 'python') }} className="field px-2 py-1"><option value="text">Plain text</option><option value="python">Python</option></select></label>}
+      <label className="flex items-center gap-1.5"><input type="checkbox" checked={vimEnabled} disabled={disabled} onChange={event => {
+        const enabled = event.target.checked
+        setVimEnabled(enabled)
+        try { localStorage.setItem('answer-editor-vim', String(enabled)) } catch { /* Keep the preference for this editor. */ }
+      }} /> Vim mode</label>
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={formatter} disabled={disabled} onChange={event => { formatRequest.current?.abort(); setFormatStatus(''); setFormatter(event.target.checked) }} /> Enable formatter</label>
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={lsp} disabled={disabled} onChange={event => { diagnosticsRequest.current?.abort(); completionRequest.current?.abort(); setLsp(event.target.checked) }} /> Enable Python LSP</label>
       <button type="button" disabled={disabled || !formatter || mode !== 'python'} onClick={format} className="rounded border border-carbon-700 px-2 py-1 text-ink hover:bg-carbon-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple disabled:cursor-not-allowed disabled:opacity-50">Format Python</button>

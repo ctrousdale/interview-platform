@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libseccomp2 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
     && useradd --system --user-group --uid 10001 --no-create-home --home-dir /tmp tooling
-COPY server.py executor.py suites.py ./
+COPY server.py executor.py suites.py canonical_algorithms.py canonical_patterns.py ./
 USER 10001:10001
 EXPOSE 8080
 CMD ["python", "server.py"]
