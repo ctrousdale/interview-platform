@@ -33,8 +33,8 @@ const theme = EditorView.theme({
   '.cm-tooltip-autocomplete ul li[aria-selected]': { backgroundColor: '#5e3c88', color: '#fff' },
 }, { dark: true })
 
-export function AnswerEditor({ value, onChange, disabled }: { value: string; onChange: (value: string) => void; disabled: boolean }) {
-  const [mode, setMode] = useState<'text' | 'python'>('text')
+export function AnswerEditor({ value, onChange, disabled, coding = false }: { value: string; onChange: (value: string) => void; disabled: boolean; coding?: boolean }) {
+  const [mode, setMode] = useState<'text' | 'python'>(coding ? 'python' : 'text')
   const [formatter, setFormatter] = useState(false)
   const [lsp, setLsp] = useState(false)
   const [formatStatus, setFormatStatus] = useState('')
@@ -182,7 +182,7 @@ export function AnswerEditor({ value, onChange, disabled }: { value: string; onC
 
   return <div>
     <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted">
-      <label className="flex items-center gap-2">Answer mode <select value={mode} disabled={disabled} onChange={event => { formatRequest.current?.abort(); diagnosticsRequest.current?.abort(); completionRequest.current?.abort(); setFormatStatus(''); setMode(event.target.value as 'text' | 'python') }} className="field px-2 py-1"><option value="text">Plain text</option><option value="python">Python</option></select></label>
+      {coding ? <span>Python</span> : <label className="flex items-center gap-2">Answer mode <select value={mode} disabled={disabled} onChange={event => { formatRequest.current?.abort(); diagnosticsRequest.current?.abort(); completionRequest.current?.abort(); setFormatStatus(''); setMode(event.target.value as 'text' | 'python') }} className="field px-2 py-1"><option value="text">Plain text</option><option value="python">Python</option></select></label>}
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={formatter} disabled={disabled} onChange={event => { formatRequest.current?.abort(); setFormatStatus(''); setFormatter(event.target.checked) }} /> Enable formatter</label>
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={lsp} disabled={disabled} onChange={event => { diagnosticsRequest.current?.abort(); completionRequest.current?.abort(); setLsp(event.target.checked) }} /> Enable Python LSP</label>
       <button type="button" disabled={disabled || !formatter || mode !== 'python'} onClick={format} className="rounded border border-carbon-700 px-2 py-1 text-ink hover:bg-carbon-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple disabled:cursor-not-allowed disabled:opacity-50">Format Python</button>

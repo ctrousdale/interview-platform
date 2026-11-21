@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import signal
 import tempfile
+import sys
+
+import suites
 
 from aiohttp import web
 
@@ -212,10 +215,90 @@ async def handle(request):
         raise web.HTTPBadGateway(text=str(exc) if isinstance(exc, ToolError) else "Python tooling failed")
 
 
+async def suite_metadata(request):
+    return web.json_response([
+        {"id": question_id, "starterCode": suite["starterCode"],
+         "testInstructions": suite["testInstructions"]}
+        for question_id, suite in suites.SUITES.items()
+    ])
+
+
+async def execute(request):
+    try:
+        async with asyncio.timeout(25):
+            return await execute_inner(request)
+    except TimeoutError:
+        raise web.HTTPServiceUnavailable(text="Python execution capacity timed out")
+
+
+async def execute_inner(request):
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise web.HTTPBadRequest(text="Expected a JSON object")
+    if not isinstance(payload, dict) or not isinstance(payload.get("code"), str):
+        raise web.HTTPBadRequest(text="code must be a string")
+    code = payload["code"]
+    try:
+        size = len(code.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise web.HTTPBadRequest(text="code must contain valid Unicode")
+    if size > MAX_SOURCE:
+        raise web.HTTPRequestEntityTooLarge(max_size=MAX_SOURCE, actual_size=size)
+    question_id = payload.get("questionId")
+    mode = payload.get("mode")
+    if not isinstance(question_id, str) or question_id not in suites.SUITES:
+        raise web.HTTPNotFound(text="Unknown coding question")
+    if mode not in ("run", "submit"):
+        raise web.HTTPBadRequest(text="mode must be run or submit")
+    tests = [test for test in suites.SUITES[question_id]["tests"]
+             if mode == "submit" or test["run"]]
+    if not tests:
+        raise web.HTTPServiceUnavailable(text="No tests configured")
+
+    failed = []
+    error = None
+    async with request.app["slots"]:
+        deadline = asyncio.get_running_loop().time() + 20
+        for test in tests:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                failed.append(test["id"])
+                error = "Execution timed out"
+                continue
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-I", str(Path(__file__).with_name("executor.py")),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL, cwd="/", env=PROCESS_ENV,
+                start_new_session=True,
+            )
+            try:
+                data = json.dumps({"code": code, "test": test["code"]}).encode("utf-8")
+                try:
+                    await asyncio.wait_for(process.communicate(data), timeout=min(3, remaining))
+                except TimeoutError:
+                    failed.append(test["id"])
+                    error = "Execution timed out"
+                    continue
+                if process.returncode == 125:
+                    raise web.HTTPServiceUnavailable(text="Python sandbox unavailable")
+                if process.returncode != 42:
+                    failed.append(test["id"])
+            finally:
+                await stop_process(process)
+    result = {"passed": not failed, "total": len(tests), "failedTestIds": failed}
+    if error:
+        result["error"] = error
+    return web.json_response(result)
+
+
+
 def create_app():
     app = web.Application(client_max_size=MAX_BODY)
     app["slots"] = asyncio.Semaphore(MAX_CONCURRENT)
     app.router.add_post("/python/{method:format|diagnostics|completion}", handle)
+    app.router.add_get("/python/suites", suite_metadata)
+    app.router.add_post("/python/execute", execute)
     return app
 
 

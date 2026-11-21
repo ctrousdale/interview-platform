@@ -55,3 +55,46 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
         response = await client.post("/python/format", json={"code": "x" * (server.MAX_SOURCE + 1)})
         self.assertEqual(response.status, 413)
+
+
+class ExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = TestClient(TestServer(server.create_app()))
+        await self.client.start_server()
+        self.addAsyncCleanup(self.client.close)
+
+    async def test_metadata_and_execution_validation(self):
+        registry = {"question": {"starterCode": "pass", "testInstructions": "test",
+                                 "tests": [{"id": "one", "code": "assert True", "run": True}]}}
+        with patch.object(server.suites, "SUITES", registry):
+            response = await self.client.get("/python/suites")
+            self.assertEqual(await response.json(), [{"id": "question", "starterCode": "pass",
+                                                      "testInstructions": "test"}])
+            response = await self.client.post("/python/execute", json={
+                "questionId": "question", "mode": "bad", "code": "pass"})
+            self.assertEqual(response.status, 400)
+
+    async def test_sandbox_blocks_network_filesystem_and_signals(self):
+        registry = {"question": {"starterCode": "", "testInstructions": "",
+                                 "tests": [{"id": "one", "code": "check()", "run": True}]}}
+        code = '''
+def check():
+    import os, socket
+    for action in (lambda: open("/proc/self/environ").read(),
+                   lambda: socket.socket(),
+                   lambda: os.kill(os.getppid(), 0),
+                   lambda: open("/tmp/escape", "w")):
+        try:
+            action()
+        except OSError:
+            continue
+        raise AssertionError("sandbox allowed forbidden operation")
+'''
+        with patch.object(server.suites, "SUITES", registry):
+            response = await self.client.post("/python/execute", json={
+                "questionId": "question", "mode": "submit", "code": code})
+            if response.status == 503:
+                self.skipTest("kernel sandbox unavailable")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(),
+                             {"passed": True, "total": 1, "failedTestIds": []})

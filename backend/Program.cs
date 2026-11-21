@@ -1,3 +1,7 @@
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -5,19 +9,66 @@ var builder = WebApplication.CreateBuilder(args);
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection must be configured.");
 builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connectionString));
+builder.Services.AddSingleton(new HttpClient
+{
+    BaseAddress = new Uri(builder.Configuration["PythonToolsUrl"] ?? "http://python-tools:8080"),
+    Timeout = TimeSpan.FromSeconds(30)
+});
 
 var app = builder.Build();
 var dataSource = app.Services.GetRequiredService<NpgsqlDataSource>();
 await InitializeDatabaseAsync(dataSource, app.Logger, app.Lifetime.ApplicationStopping);
 
-app.MapGet("/api/questions", async (NpgsqlDataSource db, CancellationToken cancellationToken) =>
+app.MapGet("/api/questions", async (NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken) =>
 {
+    var suites = await GetSuitesAsync(python, cancellationToken);
+    if (suites is null)
+        return Results.Problem("The coding test service is unavailable.", statusCode: StatusCodes.Status503ServiceUnavailable);
+
     var questions = new List<Question>();
     await using var command = db.CreateCommand("SELECT id, category, difficulty, title, prompt FROM questions ORDER BY category, title");
     await using var reader = await command.ExecuteReaderAsync(cancellationToken);
     while (await reader.ReadAsync(cancellationToken))
-        questions.Add(new Question(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4)));
+    {
+        var id = reader.GetString(0);
+        var category = reader.GetString(1);
+        var coding = IsCoding(category);
+        var suite = suites.FirstOrDefault(s => s.Id == id);
+        if (coding && suite is null)
+            return Results.Problem($"No coding test suite is available for {id}.", statusCode: StatusCodes.Status503ServiceUnavailable);
+        questions.Add(new Question(id, category, reader.GetString(2), reader.GetString(3), reader.GetString(4),
+            coding, false, suite?.StarterCode, suite?.TestInstructions));
+    }
+    await reader.CloseAsync();
+    for (var i = 0; i < questions.Count; i++)
+    {
+        if (!questions[i].Coding)
+            continue;
+        await using var completed = db.CreateCommand($"SELECT EXISTS (SELECT 1 FROM {SubmissionTable(questions[i].Id)} WHERE passed)");
+        questions[i] = questions[i] with { Complete = (bool)(await completed.ExecuteScalarAsync(cancellationToken))! };
+    }
     return Results.Ok(questions);
+});
+
+app.MapPost("/api/questions/{id}/run", async (string id, CodeRequest request, NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken) =>
+    await ExecuteCodeAsync(id, request, false, db, python, cancellationToken));
+
+app.MapPost("/api/questions/{id}/submit", async (string id, CodeRequest request, NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken) =>
+    await ExecuteCodeAsync(id, request, true, db, python, cancellationToken));
+
+app.MapGet("/api/questions/{id}/submissions", async (string id, NpgsqlDataSource db, CancellationToken cancellationToken) =>
+{
+    var knownId = await FindCodingQuestionAsync(db, id, cancellationToken);
+    if (knownId is null)
+        return Results.NotFound();
+    var submissions = new List<CodingSubmission>();
+    await using var command = db.CreateCommand($"SELECT code, passed, total, failed_test_ids, error, created_at FROM {SubmissionTable(knownId)} ORDER BY created_at DESC, id DESC");
+    await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+    while (await reader.ReadAsync(cancellationToken))
+        submissions.Add(new CodingSubmission(reader.GetString(0), reader.GetBoolean(1), reader.GetInt32(2),
+            reader.GetFieldValue<Guid[]>(3).Select(g => g.ToString()).ToArray(),
+            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetFieldValue<DateTime>(5)));
+    return Results.Ok(submissions);
 });
 
 app.MapGet("/api/sessions", async (NpgsqlDataSource db, CancellationToken cancellationToken) =>
@@ -94,6 +145,73 @@ static Session ReadSession(NpgsqlDataReader reader) => new(
     reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3),
     reader.GetString(4), reader.GetFieldValue<DateTime>(5));
 
+static bool IsCoding(string category) => category is "Algorithms" or "Design Patterns";
+
+// The name is derived only from an ID retrieved from questions, never from a request.
+static string SubmissionTable(string knownId) =>
+    "\"submissions_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(knownId)))[..48].ToLowerInvariant() + "\"";
+
+static async Task<string?> FindCodingQuestionAsync(NpgsqlDataSource db, string id, CancellationToken cancellationToken)
+{
+    await using var command = db.CreateCommand("SELECT id FROM questions WHERE id = @id AND category IN ('Algorithms', 'Design Patterns')");
+    command.Parameters.AddWithValue("id", id);
+    return (string?)await command.ExecuteScalarAsync(cancellationToken);
+}
+
+static async Task<SuiteMetadata[]?> GetSuitesAsync(HttpClient python, CancellationToken cancellationToken)
+{
+    try
+    {
+        return await python.GetFromJsonAsync<SuiteMetadata[]>("/python/suites", cancellationToken);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or JsonException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+    {
+        return null;
+    }
+}
+
+static async Task<IResult> ExecuteCodeAsync(string id, CodeRequest request, bool submit, NpgsqlDataSource db, HttpClient python, CancellationToken cancellationToken)
+{
+    if (request.Code is null)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["code"] = ["Code is required."] });
+    var knownId = await FindCodingQuestionAsync(db, id, cancellationToken);
+    if (knownId is null)
+        return Results.NotFound();
+
+    RunResult? result;
+    try
+    {
+        using var response = await python.PostAsJsonAsync("/python/execute", new { questionId = knownId, code = request.Code, mode = submit ? "submit" : "run" }, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        result = await response.Content.ReadFromJsonAsync<RunResult>(cancellationToken);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or JsonException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+    {
+        return Results.Problem("The coding test service is unavailable.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    if (result is null || result.Total <= 0 || result.FailedTestIds is null ||
+        result.FailedTestIds.Any(id => !Guid.TryParse(id, out _)) ||
+        (result.Passed && (result.FailedTestIds.Length != 0 || result.Error is not null)))
+        return Results.Problem("The coding test service returned an invalid result.", statusCode: StatusCodes.Status502BadGateway);
+
+    if (submit)
+    {
+        await using var command = db.CreateCommand($"""
+            INSERT INTO {SubmissionTable(knownId)} (id, code, passed, total, failed_test_ids, error, created_at)
+            VALUES (@id, @code, @passed, @total, @failed_test_ids, @error, @created_at)
+            """);
+        command.Parameters.AddWithValue("id", Guid.NewGuid());
+        command.Parameters.AddWithValue("code", request.Code);
+        command.Parameters.AddWithValue("passed", result.Passed);
+        command.Parameters.AddWithValue("total", result.Total);
+        command.Parameters.AddWithValue("failed_test_ids", result.FailedTestIds.Select(Guid.Parse).ToArray());
+        command.Parameters.AddWithValue("error", NpgsqlDbType.Text, (object?)result.Error ?? DBNull.Value);
+        command.Parameters.AddWithValue("created_at", NpgsqlDbType.TimestampTz, DateTime.UtcNow);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+    return Results.Ok(result);
+}
+
 static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, CancellationToken cancellationToken)
 {
     const int maxAttempts = 15;
@@ -135,10 +253,47 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
                     ('patterns-strategy', 'Design Patterns', 'Easy', 'Choose a pricing strategy', 'A checkout service supports regular, seasonal, and member discounts. Design a Strategy-based solution in Python that lets the caller choose a pricing rule without changing the checkout service. Explain how you would test the rules and handle invalid prices.'),
                     ('patterns-observer', 'Design Patterns', 'Medium', 'Publish order updates', 'An order service must notify email and inventory components when an order changes. Design an Observer-based solution in Python that supports subscribing and unsubscribing. Discuss what happens if one observer fails and how you would avoid duplicate subscriptions.'),
                     ('patterns-factory', 'Design Patterns', 'Medium', 'Create notification channels', 'An application sends notifications by email or SMS, with more channels planned. Design a Factory-based solution in Python that creates the appropriate sender from configuration. Explain how unsupported channel types and sender dependencies should be handled.'),
-                    ('patterns-decorator', 'Design Patterns', 'Medium', 'Compose request behavior', 'A client sends requests through a common interface. Add optional logging and retry behavior using the Decorator pattern in Python without changing the underlying client. Explain how decorator order affects behavior and when retries are unsafe.')
+                    ('patterns-decorator', 'Design Patterns', 'Medium', 'Compose request behavior', 'A client sends requests through a common interface. Add optional logging and retry behavior using the Decorator pattern in Python without changing the underlying client. Explain how decorator order affects behavior and when retries are unsafe.'),
+                    ('google-message-dedup', 'Algorithms', 'Medium', 'Deduplicate a message stream', 'Implement a message filter that receives messages in nondecreasing timestamp order. Accept a message only if the same text has not been accepted in the preceding 60 seconds. A message exactly 60 seconds after the previous accepted copy is allowed. Return whether each message is accepted. Explain time and space complexity. Follow-up: evict expired entries so memory depends on recent traffic, not all historical messages.'),
+                    ('google-islands-lakes', 'Algorithms', 'Hard', 'Islands and enclosed lakes', 'Given a rectangular grid of land and water, count the islands, where land cells connect horizontally or vertically. Then count water regions that do not touch the grid boundary. Explain how you avoid counting the ocean as a lake. Follow-up: how would you maintain the island count as water cells become land one at a time?'),
+                    ('google-shift-timeline', 'Algorithms', 'Hard', 'Build a shift timeline', 'Given shifts as (person, start, end), produce maximal time segments during which the set of people on shift is constant. Shifts are half-open: a person ending at time t is not present at t, while a person starting at t is. A person may have overlapping shifts. Omit empty segments. Explain how you handle simultaneous events and analyze complexity.'),
+                    ('google-meeting-rooms', 'Algorithms', 'Medium', 'Minimum meeting rooms', 'Given half-open meeting intervals [start, end), return the minimum number of rooms needed. Meetings ending when another starts can share a room. Explain your algorithm and complexity. Follow-up: assign each meeting a room and identify the room used most often, breaking ties by room number.'),
+                    ('google-cheapest-flights', 'Algorithms', 'Medium', 'Cheapest flight with a stop limit', 'Given directed flights (origin, destination, nonnegative price), a source, a destination, and a maximum number of intermediate stops, find the cheapest valid price or report that none exists. Explain why tracking only one best price per city may be insufficient. Follow-up: return the route as well as its price.'),
+                    ('google-train-schedule', 'Algorithms', 'Hard', 'Earliest arrival by train', 'Given trains (origin, destination, departure, arrival), a starting station, a start time, and a destination, find the earliest possible arrival and return an itinerary. A transfer is allowed when the next departure is at or after the previous arrival. Times are absolute and every train arrives after it departs. Explain your approach and complexity.'),
+                    ('google-router-reachability', 'Algorithms', 'Medium', 'Message routing with broken routers', 'Routers have coordinates and individual transmission radii. A working router receiving a message broadcasts it once to every working router within its radius. Given the routers, broken router IDs, a source, and a destination, determine whether the message can reach the destination. Discuss directed reachability, boundary distances, and complexity. Follow-up: return a route with the fewest hops.'),
+                    ('google-top-k-similar', 'Algorithms', 'Medium', 'Top similar recommendations', 'Movies form an undirected graph; each movie has a similarity score to a given starting movie. Return the top k distinct reachable movies, excluding the start, ordered by descending score with ID as a tie-breaker. Handle cycles and fewer than k reachable movies. Analyze time and space complexity. Follow-up: how would you reduce memory used for ranking?'),
+                    ('google-dag-longest-path', 'Algorithms', 'Medium', 'Longest path in a DAG', 'Given a directed acyclic graph, find the longest path by number of edges and return its vertices. The graph may be disconnected or contain isolated vertices. Explain how your algorithm uses the DAG property and analyze its complexity. Follow-up: handle weighted edges, including negative weights.'),
+                    ('google-dependency-order', 'Algorithms', 'Medium', 'Schedule dependent tasks', 'Given tasks and directed prerequisite pairs, return an order in which every prerequisite precedes its dependent task, or report that no such order exists. Include tasks with no dependencies. Explain how you detect cycles and analyze complexity. Follow-up: group tasks into the fewest parallel rounds assuming unlimited workers.'),
+                    ('google-connect-sticks', 'Algorithms', 'Medium', 'Minimum cost to connect segments', 'Given nonnegative segment lengths, repeatedly join any two segments; each join costs the sum of their lengths and creates a segment of that length. Return the minimum total cost to join all segments, with zero cost for fewer than two. Explain why your choice is optimal and analyze complexity. Follow-up: return the sequence of joins.'),
+                    ('google-string-transform', 'Algorithms', 'Hard', 'Transform characters with global replacements', 'Given equal-length strings over lowercase English letters, determine whether the first can become the second using any number of operations that replace every occurrence of one letter with another letter. Explain conflicts and cycles, including when no spare letter is available. Analyze complexity. Follow-up: produce a sequence of replacements when possible.'),
+                    ('google-dynamic-intervals', 'Algorithms', 'Hard', 'Maintain booking availability', 'Design a class for a single room with book(start, end) and cancel(start, end). Bookings are half-open intervals; reject a booking that overlaps an existing one, and cancel only an exact existing booking. Explain the data structures, operation costs, and boundary cases. Follow-up: support finding the first available slot of a requested duration after a given time.'),
+                    ('google-news-feed', 'System Design', 'Hard', 'Design a news feed', 'Design a news feed for users following other accounts. Clarify functional and scale requirements, then discuss APIs, storage, ranking, fanout, pagination, freshness, and failure handling. Compare fanout on write and fanout on read, including the impact of highly popular authors.'),
+                    ('google-video-distribution', 'System Design', 'Hard', 'Design video distribution', 'Design a service that uploads, processes, and streams video to a global audience. Define the scope and scale assumptions; discuss upload, transcoding, object storage, delivery, reliability, and playback latency. Explain trade-offs and bottlenecks.'),
+                    ('google-ambiguity', 'Behavioral', 'Medium', 'Lead through ambiguity', 'Describe a time you made progress on an ambiguous engineering problem. How did you clarify the goal, involve others, decide what to do, and measure the outcome? What would you change?'),
+                    ('google-user-first', 'Behavioral', 'Medium', 'Put users first', 'Describe a time you prioritized users when technical or business pressures pointed elsewhere. What evidence informed your decision, how did you align stakeholders, and what was the outcome?')
                 ON CONFLICT (id) DO NOTHING;
                 """, connection, transaction);
             await command.ExecuteNonQueryAsync(cancellationToken);
+            var codingIds = new List<string>();
+            await using (var select = new NpgsqlCommand("SELECT id FROM questions WHERE category IN ('Algorithms', 'Design Patterns')", connection, transaction))
+            await using (var reader = await select.ExecuteReaderAsync(cancellationToken))
+                while (await reader.ReadAsync(cancellationToken))
+                    codingIds.Add(reader.GetString(0));
+            foreach (var id in codingIds)
+            {
+                await using var create = new NpgsqlCommand($"""
+                    CREATE TABLE IF NOT EXISTS {SubmissionTable(id)} (
+                        id uuid PRIMARY KEY,
+                        code text NOT NULL,
+                        passed boolean NOT NULL,
+                        total integer NOT NULL,
+                        failed_test_ids uuid[] NOT NULL,
+                        error text,
+                        created_at timestamptz NOT NULL
+                    )
+                    """, connection, transaction);
+                await create.ExecuteNonQueryAsync(cancellationToken);
+            }
             await transaction.CommitAsync(cancellationToken);
             return;
         }
@@ -151,7 +306,11 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
     }
 }
 
-record Question(string Id, string Category, string Difficulty, string Title, string Prompt);
+record Question(string Id, string Category, string Difficulty, string Title, string Prompt, bool Coding, bool Complete, string? StarterCode, string? TestInstructions);
+record SuiteMetadata(string Id, string StarterCode, string TestInstructions);
+record CodeRequest(string? Code);
+record RunResult(bool Passed, int Total, string[] FailedTestIds, string? Error);
+record CodingSubmission(string Code, bool Passed, int Total, string[] FailedTestIds, string? Error, DateTime CreatedAt);
 record Session(string Id, string QuestionId, string QuestionTitle, string Category, string Answer, DateTime CreatedAt);
 record CreateSessionRequest(string? QuestionId, string? Answer);
 record Preferences(double DescriptionWidth);

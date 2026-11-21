@@ -19,9 +19,12 @@ services:
     environment:
       ASPNETCORE_URLS: http://+:8080
       ConnectionStrings__DefaultConnection: Host=db;Port=5432;Database=interview_practice;Username=interview;Password=interview
+      PythonToolsUrl: http://python-tools:8080
     depends_on:
       db:
         condition: service_healthy
+      python-tools:
+        condition: service_started
     restart: unless-stopped
 
   python-tools:

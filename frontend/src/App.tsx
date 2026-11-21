@@ -5,12 +5,17 @@ import { Button } from './components/ui/button'
 import { AnswerEditor } from './components/AnswerEditor'
 import { LearningsPage } from './components/LearningsPage'
 
-type Question = { id: string; category: string; difficulty: string; title: string; prompt: string }
+type Question = { id: string; category: string; difficulty: string; title: string; prompt: string; coding: boolean; complete: boolean; starterCode?: string; testInstructions?: string }
 type Session = { id: string; questionId: string; questionTitle: string; category: string; answer: string; createdAt: string }
+type TestResult = { passed: boolean; total: number; failedTestIds: string[]; error?: string }
+type Submission = TestResult & { code: string; createdAt: string }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options)
-  if (!response.ok) throw new Error(`Request failed (${response.status}). Please try again.`)
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: string; message?: string } | null
+    throw new Error(body?.error || body?.message || `Request failed (${response.status}). Please try again.`)
+  }
   return response.json() as Promise<T>
 }
 
@@ -34,9 +39,14 @@ function App() {
   const [category, setCategory] = useState('All topics')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState('')
+  const [saveError, setSaveError] = useState<{ questionId: string; message: string } | null>(null)
   const [savedId, setSavedId] = useState('')
   const [expandedSession, setExpandedSession] = useState('')
+  const [testing, setTesting] = useState<Record<string, 'run' | 'submit' | undefined>>({})
+  const [testResults, setTestResults] = useState<Record<string, { code: string; result?: TestResult; error?: string; action: 'run' | 'submit' }>>({})
+  const [submissions, setSubmissions] = useState<{ questionId: string; items: Submission[]; error: string; loading: boolean }>({ questionId: '', items: [], error: '', loading: false })
+  const [reloadSubmissions, setReloadSubmissions] = useState(0)
+  const [expandedSubmission, setExpandedSubmission] = useState(-1)
   const problemLayoutRef = useRef<HTMLElement>(null)
   const [descriptionWidth, setDescriptionWidth] = useState(50)
   const descriptionWidthRef = useRef(50)
@@ -105,13 +115,52 @@ function App() {
   const selected = questions.find(q => q.id === selectedId)
   const activeCategory = selected && category !== 'All topics' && selected.category !== category ? 'All topics' : category
   const filtered = activeCategory === 'All topics' ? questions : questions.filter(q => q.category === activeCategory)
-  const answer = drafts[selectedId] ?? ''
+  const answer = drafts[selectedId] ?? (selected?.coding ? selected.starterCode ?? '' : '')
   const recentSessions = useMemo(() => [...sessions].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()), [sessions])
+  const testResult = testResults[selectedId]?.code === answer ? testResults[selectedId] : undefined
+
+  useEffect(() => {
+    if (!selected?.coding) return
+    const controller = new AbortController()
+    const questionId = selected.id
+    setSubmissions({ questionId, items: [], error: '', loading: true })
+    setExpandedSubmission(-1)
+    request<Submission[]>(`/api/questions/${encodeURIComponent(questionId)}/submissions`, { signal: controller.signal })
+      .then(items => { if (!controller.signal.aborted) setSubmissions({ questionId, items, error: '', loading: false }) })
+      .catch(error => { if (!controller.signal.aborted) setSubmissions({ questionId, items: [], error: error instanceof Error ? error.message : 'Could not load submissions.', loading: false }) })
+    return () => controller.abort()
+  }, [selected?.id, selected?.coding, reloadSubmissions])
+
+  async function testCode(action: 'run' | 'submit') {
+    if (!selected?.coding || !answer.trim() || testing[selected.id]) return
+    const questionId = selected.id
+    const code = answer
+    setTesting(current => ({ ...current, [questionId]: action }))
+    setTestResults(current => {
+      const next = { ...current }
+      delete next[questionId]
+      return next
+    })
+    try {
+      const result = await request<TestResult>(`/api/questions/${encodeURIComponent(questionId)}/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }),
+      })
+      setTestResults(current => ({ ...current, [questionId]: { code, result, action } }))
+      if (action === 'submit') {
+        setReloadQuestions(n => n + 1)
+        setReloadSubmissions(n => n + 1)
+      }
+    } catch (error) {
+      setTestResults(current => ({ ...current, [questionId]: { code, action, error: error instanceof Error ? error.message : 'Could not execute your code.' } }))
+    } finally {
+      setTesting(current => ({ ...current, [questionId]: undefined }))
+    }
+  }
 
   function chooseQuestion(id: string) {
     if (saving) return
     navigate(`/problems/${encodeURIComponent(id)}`)
-    setSaveError('')
+    setSaveError(null)
     setSavedId('')
   }
 
@@ -120,7 +169,7 @@ function App() {
     if (!selected || !answer.trim() || saving) return
     const questionId = selected.id
     setSaving(true)
-    setSaveError('')
+    setSaveError(null)
     setSavedId('')
     try {
       const session = await request<Session>('/api/sessions', {
@@ -132,7 +181,7 @@ function App() {
       setDrafts(current => ({ ...current, [questionId]: '' }))
       setSavedId(questionId)
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : 'Could not save your answer.')
+      setSaveError({ questionId, message: error instanceof Error ? error.message : 'Could not save your answer.' })
     } finally { setSaving(false) }
   }
 
@@ -172,9 +221,9 @@ function App() {
 
       <Routes>
       <Route path="/" element={<HomePage />} />
-      <Route path="/algorithms" element={<CatalogPage key="algorithms" title="Algorithms" description="Practice algorithm questions at your own pace." questionCategory="Algorithms" questions={questions} loading={questionsLoading} error={questionsError} retry={() => setReloadQuestions(n => n + 1)} />} />
+      <Route path="/algorithms" element={<CatalogPage key="algorithms" title="Algorithms" description="Practice coding problems inspired by reported Google SWE interviews, including follow-ups." questionCategory="Algorithms" questions={questions} loading={questionsLoading} error={questionsError} retry={() => setReloadQuestions(n => n + 1)} />} />
       <Route path="/design-patterns" element={<CatalogPage key="design-patterns" title="Design patterns" description="Practice software design patterns and their applications." questionCategory="Design Patterns" questions={questions} loading={questionsLoading} error={questionsError} retry={() => setReloadQuestions(n => n + 1)} />} />
-      <Route path="/problems" element={<CatalogPage key="all" title="All problems" description="Browse questions across every topic." questions={questions} loading={questionsLoading} error={questionsError} retry={() => setReloadQuestions(n => n + 1)} />} />
+      <Route path="/problems" element={<CatalogPage key="all" title="All problems" description="Practice for Google SWE III and senior interviews, alongside general interview questions." questions={questions} loading={questionsLoading} error={questionsError} retry={() => setReloadQuestions(n => n + 1)} />} />
       <Route path="/ai-interviews" element={<main className="mx-auto max-w-5xl px-4 py-10 sm:px-8 sm:py-14"><p className="text-xs font-semibold uppercase tracking-widest text-purple">Work in progress</p><h1 className="mt-3 text-3xl font-semibold tracking-tight">AI interviews</h1><p className="mt-3 text-sm text-muted">AI interviews are a work in progress and are not yet available.</p></main>} />
       <Route path="/learnings" element={<LearningsPage />} />
       <Route path="/problems/:problemId" element={
@@ -188,8 +237,10 @@ function App() {
             <div className="mt-4 flex flex-wrap gap-2">
               <span className="rounded-full bg-purple/10 px-3 py-1 text-xs font-medium text-purple">{selected.difficulty}</span>
               <span className="rounded-full bg-carbon-800 px-3 py-1 text-xs text-muted">{selected.category}</span>
+              {selected.coding && selected.complete && <span className="rounded-full bg-mint/10 px-3 py-1 text-xs font-medium text-mint">Complete</span>}
             </div>
             <p className="mt-7 whitespace-pre-wrap text-sm leading-7 text-ink">{selected.prompt}</p>
+            {selected.coding && selected.testInstructions && <div className="mt-6"><h2 className="text-sm font-semibold">Test instructions</h2><p className="mt-2 whitespace-pre-wrap text-sm leading-7 text-ink">{selected.testInstructions}</p></div>}
           </div> : <div className="p-6"><h1 className="text-lg font-semibold">Problem not found</h1><p className="mt-2 text-sm text-muted">This problem does not exist.</p><Link to="/problems" className="mt-4 inline-block text-sm text-purple hover:underline">Browse problems</Link></div>}
 
           <div className="border-t border-carbon-700">
@@ -245,14 +296,42 @@ function App() {
           <div className="flex h-11 items-center gap-2 border-b border-carbon-700 bg-carbon-800 px-4 text-sm font-medium">
             <Code2 size={16} className="text-mint" /><span id="workspace-title">Your answer</span>
           </div>
-          {selected ? <form onSubmit={saveAnswer} className="flex flex-1 flex-col p-4">
-            <AnswerEditor key={selected.id} value={answer} disabled={saving} onChange={value => { setDrafts(current => ({ ...current, [selected.id]: value })); setSavedId(''); setSaveError('') }} />
+          {selected ? <form onSubmit={event => { if (selected.coding) { event.preventDefault(); void testCode('submit') } else void saveAnswer(event) }} className="flex flex-1 flex-col p-4">
+            <AnswerEditor key={`${selected.id}-${selected.coding}`} coding={selected.coding} value={answer} disabled={saving || !!testing[selected.id]} onChange={value => { setDrafts(current => ({ ...current, [selected.id]: value })); setSavedId(''); setSaveError(null) }} />
             <div className="mt-auto flex flex-wrap items-center justify-between gap-3 border-t border-carbon-700 pt-4">
-              <span className="text-xs text-muted">Saved when you submit</span>
-              <Button disabled={!answer.trim() || saving} type="submit">{saving ? <><LoaderCircle size={15} className="animate-spin" /> Saving...</> : <>Save answer <ArrowRight size={15} /></>}</Button>
+              {selected.coding ? <>
+                <span className="text-xs text-muted">Run tests without saving, or submit to record your attempt.</span>
+                <div className="flex gap-2">
+                  <Button type="button" disabled={!answer.trim() || !!testing[selected.id]} onClick={() => void testCode('run')}>{testing[selected.id] === 'run' ? 'Running...' : 'Run'}</Button>
+                  <Button type="submit" disabled={!answer.trim() || !!testing[selected.id]}>{testing[selected.id] === 'submit' ? 'Submitting...' : 'Submit'}</Button>
+                </div>
+              </> : <>
+                <span className="text-xs text-muted">Saved when you submit</span>
+                <Button disabled={!answer.trim() || saving} type="submit">{saving ? <><LoaderCircle size={15} className="animate-spin" /> Saving...</> : <>Save answer <ArrowRight size={15} /></>}</Button>
+              </>}
             </div>
-            {saveError && <p role="alert" className="mt-3 text-sm text-[#ff8389]">{saveError}</p>}
-            {savedId === selected.id && <p role="status" className="mt-3 flex items-center gap-2 text-sm text-mint"><Check size={16} /> Answer saved to your history.</p>}
+            {selected.coding && testResult && <div role={testResult.error || testResult.result?.error ? 'alert' : 'status'} className="mt-3 text-sm">
+              {testResult.error ? <p className="text-[#ff8389]">{testResult.error}</p> : testResult.result && <>
+                <p className={testResult.result.passed ? 'text-mint' : 'text-[#ff8389]'}>{testResult.action === 'submit' ? 'Submission' : 'Run'}: {testResult.result.passed ? 'Passed' : 'Failed'} ({testResult.result.total - testResult.result.failedTestIds.length}/{testResult.result.total} tests passed)</p>
+                {testResult.result.error && <p className="mt-2 whitespace-pre-wrap text-[#ff8389]">{testResult.result.error}</p>}
+                {testResult.result.failedTestIds.length > 0 && <p className="mt-2 break-words text-xs text-muted">Failed test IDs: {testResult.result.failedTestIds.join(', ')}</p>}
+              </>}
+            </div>}
+            {!selected.coding && saveError?.questionId === selected.id && <p role="alert" className="mt-3 text-sm text-[#ff8389]">{saveError.message}</p>}
+            {!selected.coding && savedId === selected.id && <p role="status" className="mt-3 flex items-center gap-2 text-sm text-mint"><Check size={16} /> Answer saved to your history.</p>}
+            {selected.coding && <div className="mt-6 border-t border-carbon-700 pt-4">
+              <h2 className="text-sm font-medium">Submission history</h2>
+              {submissions.questionId !== selected.id || submissions.loading ? <Loading label="Loading submissions..." /> : submissions.error ? <ErrorState message={submissions.error} retry={() => setReloadSubmissions(n => n + 1)} /> : submissions.items.length === 0 ? <p className="mt-3 text-xs text-muted">No submissions yet.</p> : <div className="mt-3 space-y-1">{submissions.items.map((submission, index) => <div key={`${submission.createdAt}-${index}`} className="rounded-md bg-carbon-800">
+                <button type="button" onClick={() => setExpandedSubmission(current => current === index ? -1 : index)} aria-expanded={expandedSubmission === index} className="flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-xs focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple">
+                  <span>{submission.passed ? 'Passed' : 'Failed'} · {formatDate(submission.createdAt)} · {submission.total - submission.failedTestIds.length}/{submission.total} tests passed</span><ChevronDown size={14} />
+                </button>
+                {expandedSubmission === index && <div className="border-t border-carbon-700 px-3 py-3 text-xs text-muted">
+                  {submission.failedTestIds.length > 0 && <p className="mb-2 break-words">Failed test IDs: {submission.failedTestIds.join(', ')}</p>}
+                  {submission.error && <p className="mb-2 whitespace-pre-wrap">{submission.error}</p>}
+                  <pre className="overflow-auto whitespace-pre-wrap break-words">{submission.code}</pre>
+                </div>}
+              </div>)}</div>}
+            </div>}
           </form> : <p className="p-6 text-sm text-muted">Choose a question to write an answer.</p>}
         </section>
       </main>
@@ -266,15 +345,15 @@ function App() {
 function HomePage() {
   const sections = [
     { to: '/ai-interviews', title: 'AI interviews', description: 'Interview practice with AI, currently a work in progress.', label: 'Work in progress' },
-    { to: '/algorithms', title: 'Algorithms', description: 'Build your problem-solving skills with algorithm practice.', label: 'Practice' },
+    { to: '/algorithms', title: 'Algorithms', description: 'Practice Google-inspired coding problems and follow-ups.', label: 'Practice' },
     { to: '/design-patterns', title: 'Design patterns', description: 'Explore software design patterns through practice questions.', label: 'Practice' },
     { to: '/learnings', title: 'Learnings', description: 'Explore resources for your interview preparation.', label: 'Learn' },
   ]
 
   return <main className="mx-auto max-w-5xl px-4 py-10 sm:px-8 sm:py-14">
     <p className="text-xs font-semibold uppercase tracking-widest text-purple">Practice studio</p>
-    <h1 className="mt-3 text-3xl font-semibold tracking-tight">Prepare your way</h1>
-    <p className="mt-2 text-sm text-muted">Choose a space to practice or learn at your own pace.</p>
+    <h1 className="mt-3 text-3xl font-semibold tracking-tight">Prepare for Google SWE interviews</h1>
+    <p className="mt-2 text-sm text-muted">Practice coding, design, and behavioral questions for SWE III and senior roles.</p>
     <div className="mt-8 grid gap-4 sm:grid-cols-2">
       {sections.map(section => <Link key={section.to} to={section.to} className="group flex min-h-44 flex-col rounded-lg border border-carbon-700 bg-carbon-900 p-5 transition-colors hover:bg-carbon-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple">
         <span className="text-xs font-medium text-purple">{section.label}</span>
