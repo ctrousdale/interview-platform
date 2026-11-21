@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { basicSetup } from 'codemirror'
 import { autocompletion, type CompletionContext } from '@codemirror/autocomplete'
+import { indentWithTab } from '@codemirror/commands'
+import { indentUnit } from '@codemirror/language'
 import { python } from '@codemirror/lang-python'
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint'
 import { Compartment, EditorState } from '@codemirror/state'
-import { EditorView, placeholder } from '@codemirror/view'
+import { EditorView, keymap, placeholder } from '@codemirror/view'
 
 type Position = { line: number; character: number }
 type ServerDiagnostic = { range: { start: Position; end: Position }; severity?: number; message: string; source?: string }
@@ -58,6 +60,19 @@ export function AnswerEditor({ value, onChange, disabled, coding = false }: { va
         doc: value,
         extensions: [
           basicSetup, theme, placeholder('Start writing your answer here...'),
+          keymap.of([indentWithTab]), indentUnit.of('    '),
+          EditorView.domEventHandlers({
+            mousedown(event, editor) {
+              if (event.button !== 0 || event.detail !== 1 || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return false
+              const content = editor.contentDOM.getBoundingClientRect()
+              const end = editor.coordsAtPos(editor.state.doc.length)
+              if (!end || event.clientY <= end.bottom || event.clientX < content.left || event.clientX > content.right) return false
+              event.preventDefault()
+              editor.dispatch({ selection: { anchor: editor.state.doc.length } })
+              editor.focus()
+              return true
+            },
+          }),
           EditorView.contentAttributes.of({ 'aria-label': 'Your answer', 'aria-multiline': 'true' }),
           language.of([]), editable.of([]), completion.of([]),
           EditorView.updateListener.of(update => {
