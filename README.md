@@ -26,6 +26,8 @@ Practice sessions are stored in the `postgres_data` Docker volume and persist ac
 
 The practice workspace shows the question description and recent answers alongside the editor on wider screens. The answer editor supports plain text and Python. In Python mode, enable the formatter to format an answer, or enable language-server support for diagnostics and completion. Both tools are optional and send the current answer to the `python-tools` container; submitted code is analyzed, not executed. Answers are saved only when you select **Save answer**.
 
+On wider screens, drag the separator or focus it and use the left and right arrow keys to resize the description and answer panels. The shared single-user preference is stored as a percentage in PostgreSQL and restored across visits and browser widths.
+
 The Python tooling service runs separately from the API, without database credentials. The Compose setup is intended for local use and does not provide authentication or multi-user isolation; do not expose it to untrusted networks.
 
 The database credentials in `compose.yaml` are intended for local development only. Replace them and configure appropriate network and security settings before deploying anywhere else.

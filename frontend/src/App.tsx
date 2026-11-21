@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, Route, Routes, useMatch, useNavigate } from 'react-router-dom'
 import { ArrowRight, BookOpen, Check, ChevronDown, Clock3, Code2, FileText, List, LoaderCircle, RefreshCw } from 'lucide-react'
 import { Button } from './components/ui/button'
@@ -37,6 +37,47 @@ function App() {
   const [saveError, setSaveError] = useState('')
   const [savedId, setSavedId] = useState('')
   const [expandedSession, setExpandedSession] = useState('')
+  const problemLayoutRef = useRef<HTMLElement>(null)
+  const [descriptionWidth, setDescriptionWidth] = useState(50)
+  const descriptionWidthRef = useRef(50)
+  const resizedRef = useRef(false)
+  const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve())
+  const [preferenceError, setPreferenceError] = useState('')
+
+  useEffect(() => {
+    const controller = new AbortController()
+    request<{ descriptionWidth: number }>('/api/preferences', { signal: controller.signal })
+      .then(preferences => {
+        if (!resizedRef.current) {
+          descriptionWidthRef.current = preferences.descriptionWidth
+          setDescriptionWidth(preferences.descriptionWidth)
+        }
+      })
+      .catch(() => { if (!controller.signal.aborted && !resizedRef.current) setPreferenceError('Could not load panel width preference.') })
+    return () => controller.abort()
+  }, [])
+
+  function updateDescriptionWidth(width: number) {
+    const next = Math.max(20, Math.min(80, width))
+    resizedRef.current = true
+    descriptionWidthRef.current = next
+    setDescriptionWidth(next)
+  }
+
+  function saveDescriptionWidth() {
+    const width = descriptionWidthRef.current
+    preferenceSaveRef.current = preferenceSaveRef.current.then(async () => {
+      try {
+        await request('/api/preferences', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ descriptionWidth: width }),
+        })
+        setPreferenceError('')
+      } catch {
+        setPreferenceError('Could not save panel width preference. Adjust the separator to try again.')
+      }
+    })
+  }
 
   useEffect(() => {
     const controller = new AbortController()
@@ -137,8 +178,8 @@ function App() {
       <Route path="/ai-interviews" element={<main className="mx-auto max-w-5xl px-4 py-10 sm:px-8 sm:py-14"><p className="text-xs font-semibold uppercase tracking-widest text-purple">Work in progress</p><h1 className="mt-3 text-3xl font-semibold tracking-tight">AI interviews</h1><p className="mt-3 text-sm text-muted">AI interviews are a work in progress and are not yet available.</p></main>} />
       <Route path="/learnings" element={<LearningsPage />} />
       <Route path="/problems/:problemId" element={
-      <main id="top" className="grid gap-2 p-2 lg:min-h-[calc(100vh-56px)] lg:grid-cols-2">
-        <section className="overflow-hidden rounded-lg bg-carbon-900" aria-labelledby="description-title">
+      <main id="top" ref={problemLayoutRef} style={{ '--description-width': descriptionWidth } as React.CSSProperties} className="grid gap-2 p-2 lg:min-h-[calc(100vh-56px)] lg:grid-cols-[minmax(0,calc((100%_-_8px)*var(--description-width)/100))_8px_minmax(0,1fr)] lg:gap-0">
+        <section id="problem-description" className="min-w-0 overflow-hidden rounded-lg bg-carbon-900" aria-labelledby="description-title">
           <div className="flex h-11 items-center gap-2 border-b border-carbon-700 bg-carbon-800 px-4 text-sm font-medium">
             <BookOpen size={16} className="text-purple" /><span id="description-title">Description</span>
           </div>
@@ -164,7 +205,43 @@ function App() {
           </div>
         </section>
 
+        <div
+          role="separator"
+          aria-label="Resize description and answer panels"
+          aria-orientation="vertical"
+          aria-controls="problem-description"
+          aria-valuemin={20}
+          aria-valuemax={80}
+          aria-valuenow={Math.round(descriptionWidth)}
+          tabIndex={0}
+          className="hidden cursor-col-resize touch-none items-center justify-center focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple lg:flex"
+          onPointerDown={event => {
+            if (event.button !== 0) return
+            event.currentTarget.setPointerCapture(event.pointerId)
+          }}
+          onPointerMove={event => {
+            if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
+            const bounds = problemLayoutRef.current?.getBoundingClientRect()
+            if (bounds) updateDescriptionWidth((event.clientX - bounds.left - 12) / (bounds.width - 24) * 100)
+          }}
+          onPointerUp={event => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) saveDescriptionWidth()
+          }}
+          onPointerCancel={event => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) saveDescriptionWidth()
+          }}
+          onKeyDown={event => {
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+            event.preventDefault()
+            updateDescriptionWidth(descriptionWidthRef.current + (event.key === 'ArrowLeft' ? -2 : 2))
+            saveDescriptionWidth()
+          }}
+        >
+          <span className="h-10 w-0.5 rounded-full bg-carbon-700" />
+        </div>
+
         <section className="flex min-w-0 flex-col overflow-hidden rounded-lg bg-carbon-900" aria-labelledby="workspace-title">
+          {preferenceError && <p role="alert" className="px-4 pt-3 text-xs text-[#ff8389]">{preferenceError}</p>}
           <div className="flex h-11 items-center gap-2 border-b border-carbon-700 bg-carbon-800 px-4 text-sm font-medium">
             <Code2 size={16} className="text-mint" /><span id="workspace-title">Your answer</span>
           </div>

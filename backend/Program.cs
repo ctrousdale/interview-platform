@@ -67,6 +67,27 @@ app.MapPost("/api/sessions", async (CreateSessionRequest request, NpgsqlDataSour
     return Results.Json(session, statusCode: StatusCodes.Status201Created);
 });
 
+app.MapGet("/api/preferences", async (NpgsqlDataSource db, CancellationToken cancellationToken) =>
+{
+    await using var command = db.CreateCommand("SELECT description_width FROM user_preferences WHERE id = 1");
+    var width = await command.ExecuteScalarAsync(cancellationToken);
+    return Results.Ok(new Preferences(width is double value ? value : 50));
+});
+
+app.MapPut("/api/preferences", async (PreferencesRequest request, NpgsqlDataSource db, CancellationToken cancellationToken) =>
+{
+    if (request.DescriptionWidth is not double width || !double.IsFinite(width) || width < 20 || width > 80)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["descriptionWidth"] = ["Description width must be between 20 and 80 percent."] });
+
+    await using var command = db.CreateCommand("""
+        INSERT INTO user_preferences (id, description_width) VALUES (1, @width)
+        ON CONFLICT (id) DO UPDATE SET description_width = EXCLUDED.description_width
+        """);
+    command.Parameters.AddWithValue("width", width);
+    await command.ExecuteNonQueryAsync(cancellationToken);
+    return Results.Ok(new Preferences(width));
+});
+
 app.Run();
 
 static Session ReadSession(NpgsqlDataReader reader) => new(
@@ -97,6 +118,10 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
                     created_at timestamptz NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS ix_sessions_created_at ON sessions (created_at DESC);
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    id integer PRIMARY KEY CHECK (id = 1),
+                    description_width double precision NOT NULL CHECK (description_width >= 20 AND description_width <= 80)
+                );
                 INSERT INTO questions (id, category, difficulty, title, prompt) VALUES
                     ('behavioral-conflict', 'Behavioral', 'Medium', 'Navigating conflict', 'Tell me about a time you disagreed with a teammate. How did you handle it, and what was the outcome?'),
                     ('behavioral-failure', 'Behavioral', 'Easy', 'Learning from failure', 'Describe a time something did not go as planned. What did you learn and what did you do differently afterward?'),
@@ -129,3 +154,5 @@ static async Task InitializeDatabaseAsync(NpgsqlDataSource db, ILogger logger, C
 record Question(string Id, string Category, string Difficulty, string Title, string Prompt);
 record Session(string Id, string QuestionId, string QuestionTitle, string Category, string Answer, DateTime CreatedAt);
 record CreateSessionRequest(string? QuestionId, string? Answer);
+record Preferences(double DescriptionWidth);
+record PreferencesRequest(double? DescriptionWidth);
