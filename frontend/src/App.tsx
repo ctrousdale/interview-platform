@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, Route, Routes, useMatch, useNavigate } from 'react-router-dom'
-import { ArrowRight, BookOpen, Check, ChevronDown, Clock3, Code2, FileText, List, LoaderCircle, RefreshCw } from 'lucide-react'
+import { ArrowRight, Check, ChevronDown, Clock3, Code2, FileText, List, LoaderCircle, RefreshCw } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { AnswerEditor } from './components/AnswerEditor'
 import { LearningsPage } from './components/LearningsPage'
+import { additionalSolutions, solutions } from './solutions'
 
 type Question = { id: string; category: string; difficulty: string; title: string; prompt: string; coding: boolean; complete: boolean; starterCode?: string; testInstructions?: string }
 type Session = { id: string; questionId: string; questionTitle: string; category: string; answer: string; createdAt: string }
@@ -38,6 +39,7 @@ function App() {
   const [reloadSessions, setReloadSessions] = useState(0)
   const [category, setCategory] = useState('All topics')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [problemTab, setProblemTab] = useState<{ id: string; tab: 'description' | 'solution' }>({ id: '', tab: 'description' })
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<{ questionId: string; message: string } | null>(null)
   const [savedId, setSavedId] = useState('')
@@ -113,6 +115,10 @@ function App() {
 
   const categories = useMemo(() => ['All topics', ...Array.from(new Set(questions.map(q => q.category)))], [questions])
   const selected = questions.find(q => q.id === selectedId)
+  const activeProblemTab = problemTab.id === selectedId ? problemTab.tab : 'description'
+  useEffect(() => {
+    setProblemTab({ id: selectedId, tab: 'description' })
+  }, [selectedId])
   const activeCategory = selected && category !== 'All topics' && selected.category !== category ? 'All topics' : category
   const filtered = activeCategory === 'All topics' ? questions : questions.filter(q => q.category === activeCategory)
   const answer = drafts[selectedId] ?? (selected?.coding ? selected.starterCode ?? '' : '')
@@ -228,11 +234,28 @@ function App() {
       <Route path="/learnings" element={<LearningsPage />} />
       <Route path="/problems/:problemId" element={
       <main id="top" ref={problemLayoutRef} style={{ '--description-width': descriptionWidth } as React.CSSProperties} className="grid gap-2 p-2 lg:min-h-[calc(100vh-56px)] lg:grid-cols-[minmax(0,calc((100%_-_8px)*var(--description-width)/100))_8px_minmax(0,1fr)] lg:gap-0">
-        <section id="problem-description" className="min-w-0 overflow-hidden rounded-lg bg-carbon-900" aria-labelledby="description-title">
-          <div className="flex h-11 items-center gap-2 border-b border-carbon-700 bg-carbon-800 px-4 text-sm font-medium">
-            <BookOpen size={16} className="text-purple" /><span id="description-title">Description</span>
+        <section id="problem-description" className="min-w-0 overflow-hidden rounded-lg bg-carbon-900" aria-label="Problem">
+          <div role="tablist" aria-label="Problem information" className="flex h-11 items-stretch gap-5 border-b border-carbon-700 bg-carbon-800 px-4 text-sm font-medium">
+            {(['description', 'solution'] as const).map(tab => <button
+              key={tab}
+              id={`problem-tab-${tab}`}
+              type="button"
+              role="tab"
+              aria-selected={activeProblemTab === tab}
+              aria-controls={`problem-panel-${tab}`}
+              tabIndex={activeProblemTab === tab ? 0 : -1}
+              onClick={() => setProblemTab({ id: selectedId, tab })}
+              onKeyDown={event => {
+                if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return
+                event.preventDefault()
+                const next = event.key === 'Home' ? 'description' : event.key === 'End' ? 'solution' : tab === 'description' ? 'solution' : 'description'
+                setProblemTab({ id: selectedId, tab: next })
+                document.getElementById(`problem-tab-${next}`)?.focus()
+              }}
+              className={`border-b-2 px-1 focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple ${activeProblemTab === tab ? 'border-purple text-ink' : 'border-transparent text-muted hover:text-ink'}`}
+            >{tab === 'description' ? 'Description' : 'Solution'}</button>)}
           </div>
-          {questionsLoading ? <div className="p-4"><Loading label="Loading questions..." /></div> : questionsError ? <div className="p-4"><ErrorState message={questionsError} retry={() => setReloadQuestions(n => n + 1)} /></div> : selected ? <div className="p-5 sm:p-7">
+          {questionsLoading ? <div className="p-4"><Loading label="Loading questions..." /></div> : questionsError ? <div className="p-4"><ErrorState message={questionsError} retry={() => setReloadQuestions(n => n + 1)} /></div> : selected ? activeProblemTab === 'description' ? <div id="problem-panel-description" role="tabpanel" aria-labelledby="problem-tab-description" tabIndex={0} className="p-5 sm:p-7">
             <h1 className="text-xl font-semibold tracking-tight">{selected.title}</h1>
             <div className="mt-4 flex flex-wrap gap-2">
               <span className="rounded-full bg-purple/10 px-3 py-1 text-xs font-medium text-purple">{selected.difficulty}</span>
@@ -241,6 +264,24 @@ function App() {
             </div>
             <p className="mt-7 whitespace-pre-wrap text-sm leading-7 text-ink">{selected.prompt}</p>
             {selected.coding && selected.testInstructions && <div className="mt-6"><h2 className="text-sm font-semibold">Test instructions</h2><p className="mt-2 whitespace-pre-wrap text-sm leading-7 text-ink">{selected.testInstructions}</p></div>}
+          </div> : <div id="problem-panel-solution" role="tabpanel" aria-labelledby="problem-tab-solution" tabIndex={0} className="p-5 sm:p-7">
+            <h1 className="text-xl font-semibold tracking-tight">{selected.title}</h1>
+            {solutions[selected.id] && additionalSolutions[selected.id]?.length ? [
+              { label: selected.category === 'Algorithms' ? 'Naive approach' : 'Baseline approach', solution: additionalSolutions[selected.id][0] },
+              { label: 'Intended approach', solution: solutions[selected.id] },
+              ...additionalSolutions[selected.id].slice(1).map((solution, index) => ({ label: `Alternative approach ${index + 1}`, solution })),
+            ].map(({ label, solution }) => <details key={`${selected.id}-${label}`} className="group mt-7 border-t border-carbon-700 pt-5">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-2 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple [&::-webkit-details-marker]:hidden">
+                <span className="min-w-0">
+                  <span className="block text-base font-semibold">{label} · {solution.name}</span>
+                  <span className="mt-1 block text-xs leading-5 text-muted">{solution.complexity}</span>
+                </span>
+                <ChevronDown size={16} className="shrink-0 text-muted transition-transform group-open:rotate-180" />
+              </summary>
+              <p className="mt-3 whitespace-pre-wrap text-sm leading-7">{solution.explanation}</p>
+              <h3 className="mt-6 text-sm font-semibold">Python implementation</h3>
+              <pre className="mt-2 overflow-x-auto rounded-md bg-carbon-800 p-4 text-xs leading-5"><code>{solution.code}</code></pre>
+            </details>) : <p className="mt-6 text-sm text-muted">No solution is available for this problem.</p>}
           </div> : <div className="p-6"><h1 className="text-lg font-semibold">Problem not found</h1><p className="mt-2 text-sm text-muted">This problem does not exist.</p><Link to="/problems" className="mt-4 inline-block text-sm text-purple hover:underline">Browse problems</Link></div>}
 
           <div className="border-t border-carbon-700">

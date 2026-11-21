@@ -29,6 +29,8 @@ Practice sessions are stored in the `postgres_data` Docker volume and persist ac
 The practice workspace shows the question description and history alongside the editor on wider screens. Coding problems provide Python starter code and a callable contract. **Run** checks a small subset of cases without saving; **Submit** checks the full suite and saves the code and failed test IDs. A problem is complete only after a full submission passes. Drafts remain in memory when navigating and are lost on reload. Behavioral, technical, and system-design prompts retain their plain-text answer workflow.
 
 In the answer editor, Tab indents and Shift-Tab outdents using four spaces. Press Ctrl-M (or Escape, then Tab) to let Tab move focus out of the editor.
+Each problem opens on its Description tab. Select Solution to compare a naive or baseline approach with the intended approach and other alternatives where applicable. Each header names the approach and shows its time and space complexity; select it to expand or hide the explanation and Python example. For behavioral and system-design prompts, examples illustrate an approach rather than a personal answer or a production distributed system.
+
 
 In Python mode, enable the formatter to format an answer, or enable language-server support for diagnostics and completion. Both tools are optional and send the current answer to the `python-tools` container.
 
