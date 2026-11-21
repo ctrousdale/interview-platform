@@ -24,13 +24,31 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  python-tools:
+    build: ./python-tools
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 64
+    restart: unless-stopped
+
   frontend:
     build: ./frontend
     ports:
       - "8080:80"
+      - "8443:443"
     depends_on:
       - backend
+      - python-tools
+    volumes:
+      - frontend_tls:/etc/nginx/local-tls
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  frontend_tls:
